@@ -1,0 +1,74 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== uv =====
+# uv.lock 是否提交看团队约定:
+# - 应用项目: 建议提交(锁定依赖版本, 保证可复现)
+# - 库项目: 建议忽略
+# 这里默认提交, 删除下面这行
+# uv.lock
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ===== 项目相关临时文件 =====
+.env
+.env.local
+*.log
+nohup.out
+/data/
+/traces/
+/runs/
+*.pkl
+*.bin
+
+# ===== 模型 / 大文件 =====
+/models/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+
+# ===== 敏感信息 (绝对不能上传!) =====
+kubeconfig
+.kube/
+*kubeconfig*
+*.pem
+*.key
+*.crt
+.secrets/
+secrets.yaml
+config.local.*
+
+# ===== 测试与覆盖率 =====
+.coverage
+htmlcov/
+.tox/
+
+# ===== 文档构建 =====
+docs/_build/
+site/
+
+# ===== 系统 =====
+Thumbs.db
+desktop.ini
