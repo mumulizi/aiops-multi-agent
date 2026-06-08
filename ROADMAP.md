@@ -26,6 +26,27 @@
   - Inspector / Investigator / 各阶段 / 工具调用全程 TraceTimer 包装
   - 浏览器 UI 可看完整 trace 树 + 每次 LLM prompt/completion/token
 
+### v2.0 ✅ 完成 (2026.06)
+- [x] **9 节点完整自愈流水线** (Triage → Aggregator → Classifier → Investigator → **Remediator → ApprovalGate → Executor → Validator** → Notifier)
+- [x] **Remediator Agent**: LLM 基于 hypothesis 输出修复计划 JSON (含 action / target / safety_level / rationale / rollback)
+- [x] **Approval Gate**: L1-L4 安全分级路由
+  - L3 白名单 (delete_evicted_pod / delete_completed_job_pod / restart_pod) → 自动执行
+  - L2 灰名单 (scale_deployment / evict_pod / cordon_node) → 推飞书人审 (TODO: webhook 回调)
+  - L4 黑名单 (delete_pvc / drain_node / update_image) → 直接拒绝
+- [x] **4 层安全保险**:
+  - 大开关 `AUTO_HEAL_ENABLED` (默认 false, 关闭时所有 L3 → 人审)
+  - dry-run `AUTO_HEAL_DRY_RUN` (默认 true, 即使开了大开关也只打印不动手)
+  - 速率限制 (单 target+action 1h 最多 3 次)
+  - 业务时段保护 (9-18 点 L3 → 人审, 除非 dry-run)
+- [x] **三重校验防绕过**:
+  - ApprovalGate 校验 safety_level + 大开关 + 速率 + 时段
+  - Executor 双重校验 action 必须在 L3_ALLOWED_ACTIONS dict 内
+  - remediation_actions 内部再校验资源真实状态 (必须真 Evicted 才删, 必须 RS/DS owner 才能 restart)
+- [x] **Executor T0/T2 状态快照** (前后 phase / restarts / containers ready 对比)
+- [x] **Validator 30s 同步健康检查** (Pod Ready + 重启不增长 → success)
+- [x] **完整审计日志** (内存 deque, ApprovalGate / Executor / Validator 三阶段全记录)
+- [x] **Notifier 输出完整链路** (REMEDIATION PLAN / APPROVAL GATE / EXECUTION / VALIDATION 四段)
+
 ---
 
 # 🔥 Tier S — 必做项 (v1.1 已部分完成)
@@ -314,8 +335,10 @@ forecast = model.predict(history)
 
 ---
 
-# 🔥 v2.0 — 自愈闭环 (Self-Healing)
+# ✅ v2.0 — 自愈闭环 (Self-Healing) 已完成
 
+> ✅ v2.0 已落地. 实施记录见上方 "当前进度 / v2.0 ✅ 完成". 本节保留作为设计参考.
+>
 > ⚠️ 自动修复是危险领域, 必须分级 + 安全。从 dry-run 起步, 永不直接 LLM 自由执行。
 
 ## 安全分级
@@ -461,6 +484,12 @@ T3: 验证窗口 (2min / 10min, 重启率/错误日志/业务指标)
 - [x] **Top 20 + 同类去重** (`main_inspect.py` 调度器)
 - [x] **S1 Langfuse 全链路 Trace 监控** (替代 LangSmith)
 
+## ✅ v2.0 已完成 (2026.06)
+- [x] **Remediator Agent** (LLM 修复决策, 输出 action / safety_level)
+- [x] **Approval Gate** (L1-L4 安全分级 + 4 层保险)
+- [x] **Executor** (T0/T2 状态快照, 三重校验, 完整审计)
+- [x] **Validator** (30s 同步健康检查)
+
 ## 第 1-2 周 (v1.2 重点)
 - [ ] **S5 Function Calling Native** (0.5d) — 最简单收益最快, 替代 ReAct 字符串解析
 - [ ] **S4 历史故障 Memory** (1d) — 立刻能讲 MTTR 故事
@@ -475,9 +504,12 @@ T3: 验证窗口 (2min / 10min, 重启率/错误日志/业务指标)
 - [ ] **A5 TimesFM 时序预测** (1d)
 - [ ] **A2 HyDE + Rerank** (1d)
 
-## 第 8-10 周 (v2.0 自愈闭环)
-- [ ] **S2 GraphRAG** (3d) — 替代普通向量 RAG
-- [ ] **Remediator + Approval Gate + Executor + Validator** (1-2 周)
+## 第 8-10 周 (v2.1 自愈深化)
+- [ ] **L2 人审飞书 webhook 回调** (实现批准/拒绝按钮)
+- [ ] **Validator 异步 30s/2min/10min 三次检查** (当前仅 30s 同步)
+- [ ] **修复历史 SQLite 持久化** (事后复盘 + 同故障频次统计)
+- [ ] **修复失败自动触发再诊断闭环**
+- [ ] **S2 GraphRAG** (3d) — 替代普通向量 RAG, 服务依赖图谱回答全局根因
 
 ## 远期 (v3.0)
 - [ ] **C1 Tool-use SFT 微调** (有 GPU 资源时)
@@ -489,14 +521,16 @@ T3: 验证窗口 (2min / 10min, 重启率/错误日志/业务指标)
 # 持续迭代规划
 
 ```
-- v1.0/v1.1 已完成 (2026.06): Inspector 三阶段巡检 + 5 Agent 流水线 + ReAct + 代码兜底
-  + 同类去重 (LLM 调用 ↓60%) + Langfuse 全链路 trace 监控
+- v1.0/v1.1/v2.0 已完成 (2026.06):
+  v1.0: Inspector 三阶段巡检 + 5 Agent 流水线 + ReAct + 代码兜底
+  v1.1: 同类去重 (LLM 调用 ↓60%) + Langfuse 全链路 trace 监控
+  v2.0: 9 节点完整自愈流水线 (Remediator + ApprovalGate + Executor + Validator)
+        + L1-L4 安全分级 + 4 层安全保险 + 三重校验
 - v1.2: Function Calling Native + 历史故障 Memory (LangMem 思路, 实测 MTTR ↓60%)
   + Critic Agent (CRITIC 论文范式, 反 LLM 幻觉) + Eval Set
 - v1.3: Topology-Aware 故障传播分析 + TimesFM 时序异常预测
-- v2.0: 微软 GraphRAG 知识库 (基于服务依赖图谱回答全局根因)
-  + 自愈闭环 (Remediator + Approval Gate + Executor + Validator)
-  + L1-L4 安全分级与失败自动回滚
+- v2.1: 飞书 webhook 人审回调 + Validator 异步三次检查
+  + 微软 GraphRAG 知识库 (基于服务依赖图谱回答全局根因)
 - v3.0: Tool-use SFT 微调 Qwen + Multi-Agent Debate + MCP Protocol
 ```
 

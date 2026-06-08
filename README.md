@@ -12,6 +12,8 @@
 - **真根因诊断**: 调用 Pod 日志(含 previous 崩溃前日志) + Prometheus + K8s API 三重证据
 - **同类去重 + 高覆盖**: 单次巡检 LLM 调用从 27+ 次降到 ~10 次, 异常覆盖率 18% → ~100%
 - **Langfuse 全链路追踪**: 所有 Agent / 工具 / LLM 调用的 prompt / completion / token / 耗时全程可视化, 支持失败重放与性能分析
+- **自愈闭环 (v2.0)**: 9 节点完整流水线 (Inspector → Triage → Aggregator → Classifier → Investigator → **Remediator → ApprovalGate → Executor → Validator** → Notifier);
+  L1-L4 安全分级 + 4 层安全保险 (大开关 / dry-run / 速率限制 / 业务时段); 三重防护避免 LLM 失误执行高风险动作
 - **本地 LLM**: Qwen2.5-7B 在 2 卡 Tesla T4 上 vLLM TP=2 部署, OpenAI 兼容接口
 
 ## 架构
@@ -39,19 +41,25 @@
   └────────────────────────────┬────────────────────────────────────┘
                                ▼
   ┌─────────────────────────────────────────────────────────────────┐
-  │  阶段 3: 5 Agent 诊断流水线 (LangGraph 状态机)                    │
+  │  阶段 3: 9 Agent 完整流水线 (LangGraph 状态机, v2.0 自愈闭环)      │
   │                                                                   │
-  │  Triage → Aggregator → Classifier → Investigator → Notifier      │
-  │   (清洗)   (LLM摘要)    (LLM分类)    (ReAct + 工具)    (通知)     │
+  │  Triage → Aggregator → Classifier → Investigator                 │
+  │   (清洗)   (LLM摘要)    (LLM分类)    (ReAct + 工具诊断)            │
   │                              │                                    │
   │                              ├─ get_pod_logs (含 previous 日志)  │
   │                              ├─ kubectl_describe (K8s API)       │
   │                              ├─ prometheus_query (VictoriaMetrics)│
   │                              └─ query_history_alerts             │
+  │                              │                                    │
+  │                              ▼                                    │
+  │   Remediator → ApprovalGate → Executor → Validator → Notifier    │
+  │  (LLM 决策)  (L1-L4 分级)  (执行+快照)  (健康检查)  (输出)       │
+  │                                                                   │
+  │  安全保险: 大开关 + dry-run + 速率限制 + 业务时段 + 三重校验       │
   └────────────────────────────┬────────────────────────────────────┘
                                ▼
   ┌─────────────────────────────────────────────────────────────────┐
-  │  阶段 4: 输出 N 份独立诊断报告(基于真实日志线索的 actionable 根因)│
+  │  阶段 4: 输出 N 份独立诊断报告(根因 + 修复建议 + 执行结果)         │
   └────────────────────────────┬────────────────────────────────────┘
                                ▼
   ┌─────────────────────────────────────────────────────────────────┐
@@ -101,20 +109,26 @@
 ```
 aiops-multi-agent/
 ├── agents/                  # Agent 实现
-│   ├── state.py             # 共享状态 (TypedDict)
+│   ├── state.py             # 共享状态 (TypedDict, 含自愈字段)
 │   ├── triage.py            # 告警清洗
 │   ├── aggregator.py        # LLM 聚合摘要 (集成 Langfuse callback)
 │   ├── classifier.py        # LLM 分类 + 严重度 (集成 Langfuse callback)
-│   ├── investigator.py      # ReAct 根因诊断 (核心, 集成 Langfuse callback)
+│   ├── investigator.py      # ReAct 根因诊断 (集成 Langfuse callback)
 │   ├── inspector.py         # 主动巡检 (核心, 三阶段, 集成 Langfuse trace)
-│   └── notifier.py          # 通知输出
+│   ├── remediator.py        # 修复决策 Agent (v2.0)
+│   ├── approval_gate.py     # 安全分级路由 + 4 层保险 (v2.0)
+│   ├── executor.py          # 执行 Agent + T0/T2 快照 (v2.0)
+│   ├── validator.py         # 健康验证 Agent (v2.0)
+│   └── notifier.py          # 通知输出 (含完整自愈链路报告)
 ├── tools/                   # 工具集
 │   ├── k8s_tools.py         # K8s API 真实工具(异常列表/Pod详情/日志)
 │   ├── mock_tools.py        # Investigator 工具集 (PromQL/describe/历史/日志)
+│   ├── remediation_actions.py  # L3 白名单修复操作 (v2.0)
+│   ├── safety_guards.py     # 速率限制 + 审计日志 (v2.0)
 │   └── langfuse_setup.py    # Langfuse 统一配置 (callback + trace + TraceTimer)
 ├── tests/                   # 单元/集成测试
-├── graph.py                 # LangGraph 编排
-├── main_inspect.py          # 主入口: 巡检+诊断闭环 (含 Top 20 + 去重 + Langfuse trace)
+├── graph.py                 # LangGraph 编排 (9 节点完整自愈流水线)
+├── main_inspect.py          # 主入口: 巡检+诊断+自愈闭环
 ├── pyproject.toml           # uv 依赖
 ├── ROADMAP.md               # 21 项前沿迭代方向 (v2.0 自愈 / GraphRAG / Critic ...)
 └── README.md
@@ -204,6 +218,81 @@ end_cycle_trace(trace, output={"reports": len(reports), "coverage": coverage})
 
 ![Langfuse trace screenshot](images/langfuse-trace.png)
 
+### 7. v2.0 自愈闭环: L1-L4 安全分级
+
+```
+L1 Dry-run    只输出建议, 永不执行              ← 默认起点 (最稳)
+L2 人审       推飞书 + 一键确认才执行
+L3 白名单自动 预定义安全动作直接执行              ← AUTO_HEAL_ENABLED=true 才生效
+L4 LLM 自由   LLM 决定一切                       ← 永不实现 (生产灾难)
+```
+
+**操作分级表 (L3 白名单是允许自动执行的全部范围)**:
+
+| 操作 | 等级 | 说明 |
+|------|------|------|
+| `delete_evicted_pod` | L3 | 清理 Failed/Evicted Pod, 极低风险 |
+| `delete_completed_job_pod` | L3 | 清理 Succeeded 完成态 Pod |
+| `restart_pod` | L3 | 删除 Pod 让控制器重建 (允许 ReplicaSet/DaemonSet, StatefulSet 走 L2) |
+| `scale_deployment` | L2 | 调整副本数, 需人审 |
+| `evict_pod` / `cordon_node` | L2 | 强驱逐/标记不可调度, 需人审 |
+| `delete_pvc` / `drain_node` / `update_image` | L4 | **永不自动**, 直接拒绝 |
+
+**4 层安全保险 (任何一个失效都拦得住)**:
+
+```python
+# 1. 大开关 (默认关闭)
+AUTO_HEAL_ENABLED = os.getenv("AUTO_HEAL_ENABLED", "false") == "true"
+
+# 2. dry-run (默认开启, 即使大开关开了也只打印不动手)
+AUTO_HEAL_DRY_RUN = os.getenv("AUTO_HEAL_DRY_RUN", "true") == "true"
+
+# 3. 速率限制 (单 target+action 1h 最多 3 次, 防震荡)
+ok, reason = rate_allow(target, action, max_per_hour=3)
+
+# 4. 业务时段保护 (9:00-18:00 自动 → 人审)
+if 9 <= datetime.now().hour < 18 and not is_dry_run:
+    decision = "human_review"
+```
+
+**三重校验防绕过**:
+
+```
+ApprovalGate (Layer 1): 校验 safety_level 在白名单 + 大开关 + 速率限制 + 时段保护
+        ↓
+Executor (Layer 2): 双重校验 action 必须在 L3_ALLOWED_ACTIONS dict 内
+        ↓
+remediation_actions (Layer 3): 资源真实状态校验 (必须真 Evicted 才删, 必须 RS/DS owner 才能 restart)
+```
+
+**Notifier 输出完整链路**:
+
+```
+======================================================================
+[!!] ALERT NOTIFICATION  severity=CRITICAL
+======================================================================
+label       : infra
+hypothesis  : 容器因连接被拒绝而频繁重启 (置信度: 高; ...)
+----------------------------------------------------------------------
+REMEDIATION PLAN
+  action      : restart_pod
+  target      : <namespace>/<pod-name>
+  safety      : L3
+  rationale   : 临时性问题, 重启可恢复
+  rollback    : 重启后问题依旧需检查依赖
+----------------------------------------------------------------------
+APPROVAL GATE  : ✓ AUTO
+  reason      : L3 whitelist + safety checks passed
+----------------------------------------------------------------------
+EXECUTION      : dry_run
+  log         : [DRY-RUN] would restart pod ... (owner=ReplicaSet will recreate it)
+  before      : phase=Running restarts=15227
+----------------------------------------------------------------------
+VALIDATION     : - skipped
+  reason      : no real execution (dry-run)
+======================================================================
+```
+
 ## 运行环境要求
 
 - Python 3.10+ (实测 3.11)
@@ -292,6 +381,10 @@ export LANGFUSE_PUBLIC_KEY="pk-lf-xxx"
 export LANGFUSE_SECRET_KEY="sk-lf-xxx"
 export LANGFUSE_HOST="http://<your-langfuse-host>:3000"
 
+# 自愈闭环 (默认 dry-run, 不动生产)
+export AUTO_HEAL_ENABLED=true     # 大开关 (默认 false, 关闭时所有 L3 降级人审)
+export AUTO_HEAL_DRY_RUN=true     # 仅打印不真执行 (默认 true, 推荐保留直到充分验证)
+
 # 永久生效:
 # echo 'export LANGFUSE_PUBLIC_KEY="..."' >> ~/.bashrc
 ```
@@ -349,15 +442,22 @@ uv run python main_inspect.py --help
 
 - 重复异常会重复诊断 (TODO: SQLite 持久化 + 去重缓存)
 - 诊断结果仅 stdout 输出 (TODO: 飞书/钉钉机器人推送)
-- 修复仅停留在"建议"阶段, 未真正执行 (Roadmap v2.0 自愈闭环)
+- 自愈仅 L3 白名单自动 + dry-run; L2 人审尚未实现飞书 webhook 回调
 
 ### Roadmap (摘要)
 
 完整 21 项前沿迭代方向请见 [ROADMAP.md](./ROADMAP.md)
 
-**v1.1 已完成 ✅**
+**v1.1 已完成 ✅** (2026.06)
 - [x] Top 20 + 同类去重 (覆盖率 ~100%, LLM 调用 ↓60%)
 - [x] Langfuse 全链路 Trace 监控
+
+**v2.0 已完成 ✅** (2026.06)
+- [x] Remediator Agent (LLM 修复决策, dry-run + safety_level 输出)
+- [x] Approval Gate (L1-L4 安全分级 + 4 层保险: 大开关 / dry-run / 速率限制 / 业务时段)
+- [x] Executor (T0 前快照 + T2 后快照, 三重校验防绕过, 完整审计日志)
+- [x] Validator (修复后 30s 健康检查, 自动判定 success/failed/skipped)
+- [x] 9 节点完整 LangGraph 流水线 (Triage → ... → Investigator → Remediator → ApprovalGate → Executor → Validator → Notifier)
 
 **v1.2 计划**
 - [ ] 历史故障 Memory (LangMem 思路, MTTR ↓60%)
@@ -366,11 +466,11 @@ uv run python main_inspect.py --help
 - [ ] Function Calling Native (替代 ReAct 字符串解析)
 - [ ] Tool Result Caching (5min TTL)
 
-**v2.0 自愈闭环**
-- [ ] Remediator Agent (修复决策, 含 dry-run / 安全等级)
-- [ ] Approval Gate (L1-L4 安全分级 + 人审分流)
-- [ ] Executor (执行 + 4 时间点快照, 失败回滚)
-- [ ] Validator (30s/2min/10min 健康检查)
+**v2.1 自愈闭环深化**
+- [ ] L2 人审实现: 飞书机器人 webhook 回调 (批准/拒绝按钮)
+- [ ] Validator 异步 30s/2min/10min 三次检查 (当前仅 30s 同步)
+- [ ] 修复历史持久化 (SQLite, 用于事后复盘 + 同故障频次统计)
+- [ ] 修复失败自动触发再诊断闭环
 - [ ] 微软 GraphRAG 知识库 (基于服务依赖图谱回答全局根因)
 
 **v3.0 学术前沿**
