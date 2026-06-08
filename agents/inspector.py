@@ -11,6 +11,9 @@ from tools.k8s_tools import (
     collect_all_real_issues,
 )
 from tools.mock_tools import prometheus_query
+from tools.langfuse_setup import LANGFUSE_HANDLER, TraceTimer, trace_span
+
+_callbacks = [LANGFUSE_HANDLER] if LANGFUSE_HANDLER else []
 
 _llm = ChatOpenAI(
     model="qwen2.5-7b",
@@ -18,6 +21,7 @@ _llm = ChatOpenAI(
     api_key="dummy",
     temperature=0.1,
     max_tokens=512,
+    callbacks=_callbacks,
 )
 
 DEEP_TOOLS = {
@@ -152,10 +156,16 @@ def _react_deep_dive(top_pods, max_steps=4):
             if not fn:
                 tool_result = f"工具 {tool_name} 不存在"
             else:
-                try:
-                    tool_result = fn(**args)
-                except Exception as e:
-                    tool_result = f"调用失败: {e}"
+                with TraceTimer(
+                    agent="inspector",
+                    name=f"tool:{tool_name}",
+                    input_data={"args": args, "thought": thought},
+                ) as t:
+                    try:
+                        tool_result = fn(**args)
+                    except Exception as e:
+                        tool_result = f"调用失败: {e}"
+                    t.set_output({"result_preview": str(tool_result)[:300]})
             tr = str(tool_result)[:600]
             _log(f"  [deep]   结果(前 200): {tr[:200]}")
             raw_calls.append({"tool": tool_name, "args": args, "result": tr})
@@ -203,10 +213,16 @@ def run_inspector(top_n=None, deep_max_steps=4):
 
     # 阶段 1: 强制收集真实数据
     _log("[Inspector] 阶段 1: 代码强制收集真实数据")
-    overview = get_cluster_overview()
+    with TraceTimer("inspector", "phase1:cluster_overview") as t:
+        overview = get_cluster_overview()
+        t.set_output({"overview_preview": overview[:300]})
     _log(overview)
     _log("")
-    issues = _build_issues_from_real_data(top_n=top_n)
+
+    with TraceTimer("inspector", "phase1:collect_unhealthy_pods") as t:
+        issues = _build_issues_from_real_data(top_n=top_n)
+        t.set_output({"total_issues": len(issues)})
+
     _log(f"[Inspector] 阶段 1 完成: K8s API 收集到 {len(issues)} 个真实异常 Pod")
     if not issues:
         _log("[Inspector] 集群无异常, 退出")
@@ -215,7 +231,13 @@ def run_inspector(top_n=None, deep_max_steps=4):
 
     # 阶段 2: LLM 深入调查 Top 5
     _log("[Inspector] 阶段 2: LLM 深入调查 Top 5")
-    deep_result = _react_deep_dive(issues[:5], max_steps=deep_max_steps)
+    with TraceTimer("inspector", "phase2:deep_dive",
+                    input_data={"top_pods": [p["pod"] for p in issues[:5]]}) as t:
+        deep_result = _react_deep_dive(issues[:5], max_steps=deep_max_steps)
+        t.set_output({
+            "detailed_findings_count": len(deep_result.get("detailed_findings", [])),
+            "raw_calls_count": len(deep_result.get("raw_calls", [])),
+        })
     _log("")
 
     # 阶段 3: 合并 deep finding 到 issues
@@ -233,11 +255,16 @@ def run_inspector(top_n=None, deep_max_steps=4):
             i["deep_finding"] = pod_to_finding[pkey]
             enriched_count += 1
     _log(f"[Inspector] 阶段 3 完成: {enriched_count} 个异常补充了深入发现")
+    trace_span("phase3:merge_findings", "inspector",
+               input_data={"deep_findings_count": len(deep_findings)},
+               output_data={"enriched_count": enriched_count})
     _log("")
 
     # 阶段 4: LLM 写 overview
     _log("[Inspector] 阶段 4: 生成整体摘要")
-    overview_text = _llm_overview(issues, deep_result)
+    with TraceTimer("inspector", "phase4:overview_summary") as t:
+        overview_text = _llm_overview(issues, deep_result)
+        t.set_output({"overview": overview_text[:300]})
     _log(f"  Overview: {overview_text}")
     _log("")
 

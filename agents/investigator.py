@@ -5,6 +5,9 @@ import sys
 from langchain_openai import ChatOpenAI
 from agents.state import AlertState
 from tools.mock_tools import TOOLS, TOOL_DESCRIPTIONS
+from tools.langfuse_setup import LANGFUSE_HANDLER, TraceTimer
+
+_callbacks = [LANGFUSE_HANDLER] if LANGFUSE_HANDLER else []
 
 _llm = ChatOpenAI(
     model="qwen2.5-7b",
@@ -12,6 +15,7 @@ _llm = ChatOpenAI(
     api_key="dummy",
     temperature=0,
     max_tokens=512,
+    callbacks=_callbacks,
 )
 
 _SYSTEM_TPL = """你是资深 SRE, 通过工具定位告警根因.
@@ -110,11 +114,18 @@ def investigator_node(state: AlertState) -> AlertState:
             if not fn:
                 tool_result = f"工具 {tool_name} 不存在"
             else:
-                try:
-                    tool_result = fn(**args)
-                except Exception as e:
-                    err = str(e)
-                    tool_result = f"调用失败: {err}"
+                # 用 TraceTimer 把工具调用打到 Langfuse
+                with TraceTimer(
+                    agent="investigator",
+                    name=f"tool:{tool_name}",
+                    input_data={"args": args, "thought": thought},
+                ) as t:
+                    try:
+                        tool_result = fn(**args)
+                    except Exception as e:
+                        err = str(e)
+                        tool_result = f"调用失败: {err}"
+                    t.set_output({"result_preview": str(tool_result)[:300]})
             preview = str(tool_result)[:120]
             _log(f"[Investigator]  step {step}: 结果 = {preview}...")
             # 日志可能很长, 截断到 1500 字给下一轮

@@ -1,47 +1,66 @@
 # AIOps Multi-Agent — 后续迭代路线图
 
-> 本文档记录基于当前 v1.0 后, 经过验证的、能解决实际生产问题的、AIOps + LLM 领域
+> 本文档记录基于当前 v1.1 后, 经过验证的、能解决实际生产问题的、AIOps + LLM 领域
+> 最前沿的迭代方向。共 21 个点, 按"实施难度 vs 工程价值"排序。
 > 整理时间: 2026.06
 
 ---
 
-## 当前进度 (v1.0) ✅
+## 当前进度
 
+### v1.0 ✅ 完成
 - [x] Inspector Agent 主动巡检 (三阶段: 代码强制 + LLM 深入 + 严重度规则)
 - [x] 5 Agent 诊断流水线 (Triage / Aggregator / Classifier / Investigator / Notifier)
 - [x] LangGraph 状态机编排
 - [x] ReAct 模式 + 代码兜底 (反 LLM 幻觉)
-- [x] 接入VictoriaMetrics multi-tenant 监控栈
+- [x] 接入 VictoriaMetrics multi-tenant 监控栈 (排查并解决 tenant 0/1 路由问题)
 - [x] 接入 K8s API + Pod 日志 (含 previous 崩溃前日志)
-- [x] vLLM + Qwen2.5-7B 本地部署 (2 卡 T4 + Tensor Parallel TP=2)
-- [x] 实测生产集群 (8 节点 / 389 Pod / 50 真实异常无遗漏)
+- [x] vLLM + Qwen2.5-7B 本地部署 (2 卡 Tesla T4 + Tensor Parallel TP=2)
+- [x] 实测生产集群 (多节点多命名空间, 50+ 真实异常无遗漏)
+
+### v1.1 ✅ 完成 (2026.06)
+- [x] **Top 20 + 同类去重**: 单次巡检 LLM 调用从 27+ 次降到 ~10 次, 异常覆盖率 18% → ~100%
+- [x] **Langfuse 全链路 Trace 监控** (替代 LangSmith, 见下方 S1)
+  - 本地容器化部署 Langfuse 2.x + PostgreSQL
+  - 集成 `LANGFUSE_HANDLER` 到所有 LLM 实例 (LangChain 自动捕获)
+  - Inspector / Investigator / 各阶段 / 工具调用全程 TraceTimer 包装
+  - 浏览器 UI 可看完整 trace 树 + 每次 LLM prompt/completion/token
 
 ---
 
-# 🔥 Tier S — 必做项 (v1.1 计划)
+# 🔥 Tier S — 必做项 (v1.1 已部分完成)
 
 > 这 5 项是从"demo"升级到"生产工程化"的关键。每项都对应 LLM 应用工程的核心痛点。
 
 ---
 
-## S1. LangSmith 全链路 Trace 监控
+## S1. ✅ 全链路 Trace 监控 (用 Langfuse 已实现)
 
 **问题**: 当前 Agent 内部是黑盒, 失败/慢/出错都不好排查。
 
-**做法**:
-- 方案 A (云端): 注册 smith.langchain.com (免费 5000 trace/月), 设 3 个环境变量即可
-- 方案 B (开源本地): 部署 [Langfuse](https://github.com/langfuse/langfuse), 完全离线
-- 方案 C (轻量自建): 写一个 tracer.py, 每次执行写一个 JSON 文件到 traces/ 目录
+**最终选型**: ✅ Langfuse 2.x 本地容器化部署
 
-**集成**: LangChain 框架自动捕获所有 LLM 调用, 0 代码修改 (云端方案)
+**实施细节**:
+- PostgreSQL + Langfuse 双容器, host network 部署
+- 通过环境变量 `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` 配置
+- `tools/langfuse_setup.py` 统一封装 callback handler + start/end trace + TraceTimer
+- 各 Agent 的 `ChatOpenAI` 加 `callbacks=[LANGFUSE_HANDLER]`, LangChain 自动捕获每次 LLM 调用
+- Inspector 各阶段用 `TraceTimer` 包装, 显式打 span
+- `main_inspect.py` 一个巡检周期对应一个 Langfuse trace, 通过 `session_id=cycle_id` 关联
+
+**踩过的坑** (生产环境兼容性经验):
+- langchain 1.x 删除了 `langchain.callbacks` 模块, 与 langfuse 2.60 不兼容 → 锁定 langchain 0.3.x
+- CentOS 7 + Python 3.11 + 老 gcc 4.8 编译 greenlet/cffi 失败 → 锁定 greenlet < 3.0 (有 manylinux2010 wheel)
+- VictoriaMetrics multi-tenant 模式下生产数据存于 tenant 1 而非默认 tenant 0 → URL 路径需要包含 `/select/<tenant>/...`
 
 **工业出处**:
 - LangChain 官方推荐: https://docs.smith.langchain.com/
-- Langfuse: 开源替代品, GitHub 8k+ stars
+- Langfuse 开源替代品, GitHub 8k+ stars
 
-> "全链路 Trace 监控: 每个 Agent / 工具调用的输入/输出/耗时/token 均可审计与重放"
+**价值**:
+> "Langfuse 全链路 trace 监控: 每个 Agent / 工具调用 / LLM 推理的 prompt / completion / token / 耗时全程可视化, 失败可一键 replay; session_id 关联一个巡检周期的所有 trace; 100% 离线集群可用 (本地容器化部署)"
 
-**实施成本**: 0.5 天
+**实施成本**: 0.5 天 (实际花了 ~2 天踩兼容坑)
 
 ---
 
@@ -189,7 +208,7 @@ response = llm.invoke(messages, tools=tools)
 # 100 个固定 case (从历史 trace 标注)
 eval_cases = [{
     "alert": "...",
-    "expected_keywords": ["connection refused", "192.168.48.71"],
+    "expected_keywords": ["connection refused", "<backend-ip>"],
 }]
 
 # 每次发布跑 eval
@@ -438,46 +457,51 @@ T3: 验证窗口 (2min / 10min, 重启率/错误日志/业务指标)
 
 # 实施优先级建议
 
-## 第 1 周 (v1.1 启动)
-- [ ] S5 Function Calling Native (0.5d) — 最简单收益最快
-- [ ] S4 历史故障 Memory (1d) — 立刻能讲 MTTR 故事
+## ✅ v1.1 已完成 (2026.06)
+- [x] **Top 20 + 同类去重** (`main_inspect.py` 调度器)
+- [x] **S1 Langfuse 全链路 Trace 监控** (替代 LangSmith)
 
-## 第 2-3 周 (v1.1 完成)
-- [ ] S1 LangSmith Trace (0.5d)
-- [ ] S3 Critic Agent (1d)
-- [ ] A1 Eval Set (1d)
-- [ ] A3 Tool Caching (0.5d)
+## 第 1-2 周 (v1.2 重点)
+- [ ] **S5 Function Calling Native** (0.5d) — 最简单收益最快, 替代 ReAct 字符串解析
+- [ ] **S4 历史故障 Memory** (1d) — 立刻能讲 MTTR 故事
+- [ ] **S3 Critic Agent** (1d) — 反 LLM 幻觉, 关键质量保障
 
-## 第 4-6 周 (v1.2)
-- [ ] A4 Topology-Aware (2d) — AIOps 圣杯
-- [ ] A5 TimesFM 时序预测 (1d)
-- [ ] A2 HyDE + Rerank (1d)
+## 第 3-4 周 (v1.2 收尾)
+- [ ] **A1 Eval Set + LLM-as-Judge** (1d) — 回归测试基础设施
+- [ ] **A3 Tool Result Caching** (0.5d) — 单次巡检 PromQL ↓70%
 
-## 第 7-10 周 (v2.0)
-- [ ] S2 GraphRAG (3d)
-- [ ] Remediator + Approval Gate + Executor + Validator (1-2 周)
+## 第 5-7 周 (v1.3)
+- [ ] **A4 Topology-Aware** (2d) — AIOps 圣杯方向
+- [ ] **A5 TimesFM 时序预测** (1d)
+- [ ] **A2 HyDE + Rerank** (1d)
+
+## 第 8-10 周 (v2.0 自愈闭环)
+- [ ] **S2 GraphRAG** (3d) — 替代普通向量 RAG
+- [ ] **Remediator + Approval Gate + Executor + Validator** (1-2 周)
 
 ## 远期 (v3.0)
-- [ ] C1 Tool-use SFT 微调 (有 GPU 资源时)
-- [ ] B1 Multi-Agent Debate
-- [ ] C3 MCP Protocol
+- [ ] **C1 Tool-use SFT 微调** (有 GPU 资源时)
+- [ ] **B1 Multi-Agent Debate**
+- [ ] **C3 MCP Protocol**
 
 ---
 
+# 持续迭代规划
 
-```markdown
-**持续迭代规划**:
-- v1.1: Function Calling Native + 历史故障 Memory (LangMem 思路, 实测 MTTR ↓60%)
-  + Critic Agent (CRITIC 论文范式, 反 LLM 幻觉) + Eval Set + LangSmith Trace
-- v1.2: Topology-Aware 故障传播分析 + TimesFM 时序异常预测
+```
+- v1.0/v1.1 已完成 (2026.06): Inspector 三阶段巡检 + 5 Agent 流水线 + ReAct + 代码兜底
+  + 同类去重 (LLM 调用 ↓60%) + Langfuse 全链路 trace 监控
+- v1.2: Function Calling Native + 历史故障 Memory (LangMem 思路, 实测 MTTR ↓60%)
+  + Critic Agent (CRITIC 论文范式, 反 LLM 幻觉) + Eval Set
+- v1.3: Topology-Aware 故障传播分析 + TimesFM 时序异常预测
 - v2.0: 微软 GraphRAG 知识库 (基于服务依赖图谱回答全局根因)
   + 自愈闭环 (Remediator + Approval Gate + Executor + Validator)
   + L1-L4 安全分级与失败自动回滚
 - v3.0: Tool-use SFT 微调 Qwen + Multi-Agent Debate + MCP Protocol
 ```
 
-关键词密度: CRITIC / GraphRAG / LangMem / Function Calling / Topology-Aware /
-TimesFM / SFT / MCP / Reflexion / Mem0 — 全是 2026 年 AIOps + LLM 圈最热的词。
+技术关键词: Langfuse / CRITIC / GraphRAG / LangMem / Function Calling / Topology-Aware /
+TimesFM / SFT / MCP / Reflexion / Mem0 — 2026 年 AIOps + LLM 领域的主流方向。
 
 ---
 

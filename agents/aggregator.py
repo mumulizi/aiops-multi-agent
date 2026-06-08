@@ -2,12 +2,16 @@
 import json
 from langchain_openai import ChatOpenAI
 from agents.state import AlertState
+from tools.langfuse_setup import LANGFUSE_HANDLER
+
+_callbacks = [LANGFUSE_HANDLER] if LANGFUSE_HANDLER else []
 
 _llm = ChatOpenAI(
     model="qwen2.5-7b",
     base_url="http://localhost:8001/v1",
     api_key="dummy",
     temperature=0,
+    callbacks=_callbacks,
 )
 
 

@@ -3,12 +3,16 @@ import json
 import re
 from langchain_openai import ChatOpenAI
 from agents.state import AlertState
+from tools.langfuse_setup import LANGFUSE_HANDLER
+
+_callbacks = [LANGFUSE_HANDLER] if LANGFUSE_HANDLER else []
 
 _llm = ChatOpenAI(
     model="qwen2.5-7b",
     base_url="http://localhost:8001/v1",
     api_key="dummy",
     temperature=0,
+    callbacks=_callbacks,
 )
 
 _PROMPT = """你是 SRE 分诊助手. 请对以下事件分类.
