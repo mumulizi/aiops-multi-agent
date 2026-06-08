@@ -1,0 +1,379 @@
+root@stack-ai-qa-5 aiops-multi-agent]#   uv run python -u main_inspect.py 
+/root/code/aiops-multi-agent/.venv/lib/python3.11/site-packages/langgraph/checkpoint/base/__init__.py:18: LangChainPendingDeprecationWarning: The default value of `allowed_objects` will change in a future version. Pass an explicit value (e.g., allowed_objects='messages' or allowed_objects='core') to suppress this warning.
+  from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+[Langfuse] enabled, host=http://120.48.18.179:3000
+
+######################################################################
+# 巡检周期 70962f94 开始 @ 2026-06-08 19:29:03
+######################################################################
+============================================================
+[Inspector] 启动主动巡检 (3 阶段, 代码兜底)
+============================================================
+[Inspector] 阶段 1: 代码强制收集真实数据
+[集群总览]
+  节点总数: 8 (Ready: 8)
+  Pod 总数: 389
+  Pod 状态分布: {'Running': 368, 'Succeeded': 11, 'Failed': 1, 'Pending': 9}
+  命名空间数: 18
+
+[Inspector] 阶段 1 完成: K8s API 收集到 50 个真实异常 Pod
+
+[Inspector] 阶段 2: LLM 深入调查 Top 5
+  [deep] step 0: 思考中...
+  [deep] step 0: describe_pod_real({'name': 'ccr-harbor-registry-68b7bcb984-tkxlz', 'namespace': 'ccr-system'}) - 首先查看ccr-system命名空间下的ccr-harbor-registry-68b7bcb984-tkxlz Pod
+  [deep]   结果(前 200): [Pod ccr-system/ccr-harbor-registry-68b7bcb984-tkxlz]
+  phase: Running
+  node: 192.168.48.204
+  container[registry] ready=False restarts=16578
+    waiting: CrashLoopBackOff - back-off 5m0s restarting 
+  [deep] step 1: 思考中...
+  [deep] step 1: describe_pod_real({'name': 'ccr-harbor-registry-75c547c587-pgcbn', 'namespace': 'ccr-system'}) - 接下来查看ccr-system命名空间下的ccr-harbor-registry-75c547c587-pgcbn Po
+  [deep]   结果(前 200): [Pod ccr-system/ccr-harbor-registry-75c547c587-pgcbn]
+  phase: Running
+  node: 192.168.49.51
+  container[registry] ready=False restarts=16578
+    waiting: CrashLoopBackOff - back-off 5m0s restarting f
+  [deep] step 2: 思考中...
+  [deep] step 2: prometheus_query({'query': 'container_status_container_exit_code{namespace="ccr-system",name=~"ccr-harbor-registry-68b7bcb984-tkxlz|ccr-harbor-registry-75c547c587-pgcbn"}'}) - 通过查询Prometheus指标，获取ccr-harbor-registry-68b7bcb984-tkxlz和ccr-
+  [deep]   结果(前 200): [空结果] container_status_container_exit_code{namespace="ccr-system",name=~"ccr-harbor-registry-68b7bcb984-tkxlz|ccr-harbor-registry-75c547c587-pgcbn"}
+  [deep] step 3: 思考中...
+  [deep] LLM 主动 final, 详细发现 2 条
+
+[Inspector] 阶段 3: 合并深入发现
+[Inspector] 阶段 3 完成: 2 个异常补充了深入发现
+
+[Inspector] 阶段 4: 生成整体摘要
+  Overview: K8s 集群存在50个问题，其中两个关键Pod处于CrashLoopBackOff状态，频繁重启，建议检查容器日志和系统资源使用情况。
+
+============================================================
+[Inspector] 巡检完成, 共 50 个真实异常 (无遗漏)
+============================================================
+  严重度分布: {'critical': 15, 'high': 9, 'medium': 8, 'low': 18}
+
+  Top 10:
+    1. [critical] ccr-system/ccr-harbor-registry-68b7bcb984-tkxlz CrashLoopBackOff restarts=33156
+       深入: Pod处于CrashLoopBackOff状态，容器registry和registryctl的重启次数分别为16578次，最后一次退出码为2和1。
+    2. [critical] ccr-system/ccr-harbor-registry-75c547c587-pgcbn CrashLoopBackOff restarts=33156
+       深入: Pod处于CrashLoopBackOff状态，容器registry和registryctl的重启次数分别为16578次，最后一次退出码为2和1。
+    3. [critical] kube-system/kube-external-auditor-192.168.48.78 CrashLoopBackOff restarts=27300
+    4. [critical] kube-system/kube-external-auditor-192.168.48.51 CrashLoopBackOff restarts=27298
+    5. [critical] kube-system/kube-external-auditor-192.168.48.76 CrashLoopBackOff restarts=27266
+    6. [critical] noaheepro/noaheepro-rdma-agent-qpd5d CrashLoopBackOff restarts=15024
+    7. [critical] noaheepro/noaheepro-noaheeops-task-manager-0 CrashLoopBackOff restarts=7635
+    8. [critical] fluid-system/csi-nodeplugin-fluid-2-hkf8j Unhealthy restarts=3682
+    9. [critical] noaheepro/noaheepro-agent-kd8rx Unhealthy restarts=1758
+    10. [critical] noaheepro/noaheepro-rdma-agent-sjl62 Unhealthy restarts=1598
+
+======================================================================
+[调度器] 集群异常 50 个, 优先级 critical/high 24 个
+[调度器] 同类去重后 7 组独立根因类型 (节省 17 次 LLM 调用)
+[调度器] 选 Top 7 组触发完整诊断流水线
+======================================================================
+
+----------------------------------------------------------------------
+[调度器] 诊断 1/7: [ccr-system] CrashLoopBackOff 类型, 代表 Pod: ccr-harbor-registry-68b7bcb984-tkxlz
+          组内共 2 个同类 Pod, 结论将应用到全组
+----------------------------------------------------------------------
+[Triage] 清洗完成,共 1 条告警
+[Aggregator] 事件摘要: ccr-system 中 ccr-harbor-registry-68b7bcb984-tkxlz 容器持续 CrashLoopBackOff，频繁重启。
+[Classifier] 分类: infra | 严重度: critical
+[Investigator] 开始诊断 (ReAct + 代码兜底)
+[Investigator]  step 0: 调用 get_pod_logs({'name': 'ccr-harbor-registry-68b7bcb984-tkxlz', 'namespace': 'ccr-system', 'lines': 30}) - 第一步必须调用 get_pod_logs 查看容器日志，以定位 CrashLoopBackOff 的具体原因。
+[Investigator]  step 0: 结果 = === container: registry ===
+--- 当前日志(最后 30 行) ---
+b'Appending internal tls trust CA to ca-bundle ...\nfind: /etc/harbor/...
+[Investigator] 共调用 1 次工具
+[Investigator] 结论: Pod ccr-harbor-registry-68b7bcb984-tkxlz 的 registry 容器因无法连接到外部服务 192.168.48.71:8080 导致 CrashLoopBackOff。 (置信度: 高; 关键证据: panic: execute http request failed! Retried 3 times, error: Get "http://192.168.
+[Remediator] 开始生成修复计划
+[Remediator] 修复计划: action=restart_pod safety=L3 target=ccr-system/ccr-harbor-registry-68b7bcb984-tkxlz
+[Approval] ✓ decision=executor reason=L3 whitelist + safety checks passed
+[Executor] T0 snapshot: phase=Running restarts=33158
+[Executor] executing action=restart_pod target=ccr-system/ccr-harbor-registry-68b7bcb984-tkxlz dry_run=False
+[Executor] ✓ restart triggered for pod ccr-system/ccr-harbor-registry-68b7bcb984-tkxlz (owner=ReplicaSet will recreate)
+[Executor] T2 snapshot: phase=Running restarts=33158
+[Validator] waiting 30s for pod to stabilize...
+[Validator] success: pod recreated by controller (new pod: ccr-harbor-registry-68b7bcb984-dz2hb, ready=False)
+
+======================================================================
+[!!] ALERT NOTIFICATION  severity=CRITICAL
+======================================================================
+label       : infra
+alert count : 1
+summary     : ccr-system 中 ccr-harbor-registry-68b7bcb984-tkxlz 容器持续 CrashLoopBackOff，频繁重启。
+hypothesis  : Pod ccr-harbor-registry-68b7bcb984-tkxlz 的 registry 容器因无法连接到外部服务 192.168.48.71:8080 导致 CrashLoopBackOff。 (置信度: 高; 关键证据: panic: execute http request failed! Retried 3 times, error: Get "http://192.168.48.71:8080/ccr?maxKeys=1000": dial tcp 192.168.48.71:8080: connect: connection refused)
+----------------------------------------------------------------------
+REMEDIATION PLAN
+  action      : restart_pod
+  target      : ccr-system/ccr-harbor-registry-68b7bcb984-tkxlz
+  safety      : L3
+  rationale   : Pod 处于 CrashLoopBackOff 状态，自动重启 Pod 可能会解决连接问题
+  rollback    : 如果重启后问题依旧，需要检查网络配置和外部服务状态
+----------------------------------------------------------------------
+APPROVAL GATE  : ✓ AUTO
+  reason      : L3 whitelist + safety checks passed
+----------------------------------------------------------------------
+EXECUTION      : executed
+  log         : restart triggered for pod ccr-system/ccr-harbor-registry-68b7bcb984-tkxlz (owner=ReplicaSet will recreate)
+  before      : phase=Running restarts=33158
+----------------------------------------------------------------------
+VALIDATION     : ✓ success
+  verified_at : 30s
+  reason      : pod recreated by controller (new pod: ccr-harbor-registry-68b7bcb984-dz2hb, ready=False)
+======================================================================
+
+----------------------------------------------------------------------
+[调度器] 诊断 2/7: [kube-system] CrashLoopBackOff 类型, 代表 Pod: kube-external-auditor-192.168.48.78
+          组内共 6 个同类 Pod, 结论将应用到全组
+----------------------------------------------------------------------
+[Triage] 清洗完成,共 1 条告警
+[Aggregator] 事件摘要: kube-system 中 kube-external-auditor 容器持续 CrashLoopBackOff，重启次数达 27300 次。
+[Classifier] 分类: infra | 严重度: critical
+[Investigator] 开始诊断 (ReAct + 代码兜底)
+[Investigator]  step 0: 调用 get_pod_logs({'name': 'kube-external-auditor-192.168.48.78', 'namespace': 'kube-system', 'lines': 30}) - 第一步必须调用 get_pod_logs 查看容器日志，以定位 CrashLoopBackOff 的具体原因。
+[Investigator]  step 0: 结果 = === container: kube-external-auditor ===
+--- 当前日志(最后 30 行) ---
+b'flag provided but not defined: -kubeConfig\nUsage of /g...
+[Investigator] 共调用 1 次工具
+[Investigator] 结论: kube-external-auditor 容器启动时参数错误，缺少必需的配置文件路径。 (置信度: 高; 关键证据: flag provided but not defined: -kubeConfig)
+[Remediator] 开始生成修复计划
+[Remediator] 修复计划: action=none safety=N/A target=
+[Approval] - decision=skip reason=no action needed
+
+======================================================================
+[!!] ALERT NOTIFICATION  severity=CRITICAL
+======================================================================
+label       : infra
+alert count : 1
+summary     : kube-system 中 kube-external-auditor 容器持续 CrashLoopBackOff，重启次数达 27300 次。
+hypothesis  : kube-external-auditor 容器启动时参数错误，缺少必需的配置文件路径。 (置信度: 高; 关键证据: flag provided but not defined: -kubeConfig)
+----------------------------------------------------------------------
+REMEDIATION PLAN
+  action      : none
+  rationale   : 当前问题需要人工介入检查和修改配置文件路径，自动操作无法解决。
+  rollback    : 检查配置文件路径是否正确，确认后重启容器。
+----------------------------------------------------------------------
+APPROVAL GATE  : - SKIP
+  reason      : no action needed
+======================================================================
+
+----------------------------------------------------------------------
+[调度器] 诊断 3/7: [noaheepro] CrashLoopBackOff 类型, 代表 Pod: noaheepro-rdma-agent-qpd5d
+          组内共 2 个同类 Pod, 结论将应用到全组
+----------------------------------------------------------------------
+[Triage] 清洗完成,共 1 条告警
+[Aggregator] 事件摘要: noaheepro/noaheepro-rdma-agent-qpd5d 容器频繁重启，处于 CrashLoopBackOff 状态。
+[Classifier] 分类: infra | 严重度: high
+[Investigator] 开始诊断 (ReAct + 代码兜底)
+[Investigator]  step 0: 调用 get_pod_logs({'name': 'noaheepro-rdma-agent-qpd5d', 'namespace': 'noaheepro', 'lines': 30}) - 第一步必须调用 get_pod_logs 查看容器日志，以定位 CrashLoopBackOff 的具体原因。
+[Investigator]  step 0: 结果 = === container: rdma-agent ===
+--- 当前日志(最后 30 行) ---
+b'init nvml\n1780918057360161103 [Info] rdma-agent start... \n/home/...
+[Investigator] 共调用 1 次工具
+[Investigator] 结论: rdma-agent 容器启动时因 undefined symbol 错误导致崩溃。 (置信度: 高; 关键证据: /home/ERI-Agent/bin/rdma-agent: symbol lookup error: /home/ERI-Agent/bin/rdma-agent: undefined symbol: nvmlDeviceGetCount)
+[Remediator] 开始生成修复计划
+[Remediator] 修复计划: action=none safety=N/A target=
+[Approval] - decision=skip reason=no action needed
+
+======================================================================
+[!]  ALERT NOTIFICATION  severity=HIGH
+======================================================================
+label       : infra
+alert count : 1
+summary     : noaheepro/noaheepro-rdma-agent-qpd5d 容器频繁重启，处于 CrashLoopBackOff 状态。
+hypothesis  : rdma-agent 容器启动时因 undefined symbol 错误导致崩溃。 (置信度: 高; 关键证据: /home/ERI-Agent/bin/rdma-agent: symbol lookup error: /home/ERI-Agent/bin/rdma-agent: undefined symbol: nvmlDeviceGetCount)
+----------------------------------------------------------------------
+REMEDIATION PLAN
+  action      : none
+  rationale   : 需要人工介入检查 rdma-agent 依赖的库是否正确安装和链接，自动操作无法解决此问题。
+  rollback    : 无需回滚，问题在于依赖库缺失。
+----------------------------------------------------------------------
+APPROVAL GATE  : - SKIP
+  reason      : no action needed
+======================================================================
+
+----------------------------------------------------------------------
+[调度器] 诊断 4/7: [fluid-system] Unhealthy 类型, 代表 Pod: csi-nodeplugin-fluid-2-hkf8j
+          组内共 5 个同类 Pod, 结论将应用到全组
+----------------------------------------------------------------------
+[Triage] 清洗完成,共 1 条告警
+[Aggregator] 事件摘要: csi-nodeplugin-fluid-2-hkf8j Pod 在 fluid-system 命名空间中频繁重启，已达3682次。
+[Classifier] 分类: infra | 严重度: critical
+[Investigator] 开始诊断 (ReAct + 代码兜底)
+[Investigator]  step 0: 调用 get_pod_logs({'name': 'csi-nodeplugin-fluid-2-hkf8j', 'namespace': 'fluid-system', 'lines': 30}) - 第一步必须调用 get_pod_logs 查看容器日志，以定位频繁重启的具体原因。
+[Investigator]  step 0: 结果 = === container: node-driver-registrar ===
+--- 当前日志(最后 30 行) ---
+b'W0603 11:43:00.569513   18628 connection.go:170] Still ...
+[Investigator] 共调用 1 次工具
+[Investigator] 结论: Pod频繁重启的原因可能是csi-nodeplugin无法连接到csi.sock文件。 (置信度: 高; 关键证据: Still connecting to unix:///var/lib/kubelet/csi-plugins/fuse.csi.fluid.io/csi.sock)
+[Remediator] 开始生成修复计划
+[Remediator] 修复计划: action=none safety=N/A target=
+[Approval] - decision=skip reason=no action needed
+
+======================================================================
+[!!] ALERT NOTIFICATION  severity=CRITICAL
+======================================================================
+label       : infra
+alert count : 1
+summary     : csi-nodeplugin-fluid-2-hkf8j Pod 在 fluid-system 命名空间中频繁重启，已达3682次。
+hypothesis  : Pod频繁重启的原因可能是csi-nodeplugin无法连接到csi.sock文件。 (置信度: 高; 关键证据: Still connecting to unix:///var/lib/kubelet/csi-plugins/fuse.csi.fluid.io/csi.sock)
+----------------------------------------------------------------------
+REMEDIATION PLAN
+  action      : none
+  rationale   : 当前问题需要进一步调查csi-nodeplugin的具体原因，自动操作可能无法解决问题，且可能带来数据风险。
+  rollback    : 无需回滚，直接进行人工干预，检查csi-nodeplugin的日志和配置。
+----------------------------------------------------------------------
+APPROVAL GATE  : - SKIP
+  reason      : no action needed
+======================================================================
+
+----------------------------------------------------------------------
+[调度器] 诊断 5/7: [noaheepro] Unhealthy 类型, 代表 Pod: noaheepro-agent-kd8rx
+          组内共 6 个同类 Pod, 结论将应用到全组
+----------------------------------------------------------------------
+[Triage] 清洗完成,共 1 条告警
+[Aggregator] 事件摘要: noaheepro/noaheepro-agent-kd8rx Pod频繁重启，状态异常。
+[Classifier] 分类: infra | 严重度: high
+[Investigator] 开始诊断 (ReAct + 代码兜底)
+[Investigator]  step 0: 调用 get_pod_logs({'name': 'noaheepro-agent-kd8rx', 'namespace': 'noaheepro', 'lines': 30}) - 第一步必须调用 get_pod_logs 查看容器日志，以定位频繁重启的具体原因。
+[Investigator]  step 0: 结果 = === container: noaheepro-agent ===
+--- 当前日志(最后 30 行) ---
+b'\x1b[90m2026-06-08T19:28:26+08:00\x1b[0m \x1b[31mERR\x1b[0m \...
+[Investigator] 共调用 1 次工具
+[Investigator] 结论: Pod频繁重启的原因是与containerd通信失败，具体表现为连接refused错误。 (置信度: 高; 关键证据: connection error: desc = "transport: Error while dialing: dial unix /run/containerd/containerd.sock: connect: connection refused")
+[Remediator] 开始生成修复计划
+[Remediator] 修复计划: action=restart_pod safety=L3 target=noaheepro/noaheepro-agent-kd8rx
+[Approval] ✓ decision=executor reason=L3 whitelist + safety checks passed
+[Executor] T0 snapshot: phase=Running restarts=1758
+[Executor] executing action=restart_pod target=noaheepro/noaheepro-agent-kd8rx dry_run=False
+[Executor] ✓ restart triggered for pod noaheepro/noaheepro-agent-kd8rx (owner=DaemonSet will recreate)
+[Executor] T2 snapshot: phase=Running restarts=1758
+[Validator] waiting 30s for pod to stabilize...
+[Validator] success: pod recreated by controller (new pod: noaheepro-agent-vj96k, ready=True)
+
+======================================================================
+[!]  ALERT NOTIFICATION  severity=HIGH
+======================================================================
+label       : infra
+alert count : 1
+summary     : noaheepro/noaheepro-agent-kd8rx Pod频繁重启，状态异常。
+hypothesis  : Pod频繁重启的原因是与containerd通信失败，具体表现为连接refused错误。 (置信度: 高; 关键证据: connection error: desc = "transport: Error while dialing: dial unix /run/containerd/containerd.sock: connect: connection refused")
+----------------------------------------------------------------------
+REMEDIATION PLAN
+  action      : restart_pod
+  target      : noaheepro/noaheepro-agent-kd8rx
+  safety      : L3
+  rationale   : 频繁重启的 Pod 与 containerd 通信失败，重启 Pod 可能会解决连接问题
+  rollback    : 如果重启后问题依旧，需要检查 containerd 服务是否正常运行
+----------------------------------------------------------------------
+APPROVAL GATE  : ✓ AUTO
+  reason      : L3 whitelist + safety checks passed
+----------------------------------------------------------------------
+EXECUTION      : executed
+  log         : restart triggered for pod noaheepro/noaheepro-agent-kd8rx (owner=DaemonSet will recreate)
+  before      : phase=Running restarts=1758
+----------------------------------------------------------------------
+VALIDATION     : ✓ success
+  verified_at : 30s
+  reason      : pod recreated by controller (new pod: noaheepro-agent-vj96k, ready=True)
+======================================================================
+
+----------------------------------------------------------------------
+[调度器] 诊断 6/7: [cce-system] Unhealthy 类型, 代表 Pod: node-debug-y6yw
+          组内共 2 个同类 Pod, 结论将应用到全组
+----------------------------------------------------------------------
+[Triage] 清洗完成,共 1 条告警
+[Aggregator] 事件摘要: node-debug-y6yw节点上的cce-system命名空间下Pod频繁重启，共1420次。
+[Classifier] 分类: infra | 严重度: high
+[Investigator] 开始诊断 (ReAct + 代码兜底)
+[Investigator]  step 0: 调用 query_history_alerts({'alertname': 'CrashLoopBackOff', 'days': 7}) - 首先需要确认是否有CrashLoopBackOff的告警，以确定是否与频繁重启有关。
+[Investigator]  step 0: 结果 = [历史告警] 集群当前 12 个 Pod 出现 CrashLoopBackOff 相关问题:
+  - kube-system/kube-external-auditor-192.168.48.78 restarts=27300 reason...
+[Investigator]  step 1: 调用 get_pod_logs({'name': 'cce-system/node-debug-y6yw', 'namespace': 'cce-system', 'lines': 30}) - 虽然没有直接的CrashLoopBackOff告警，但考虑到频繁重启的问题，我们还是先获取该Pod的日志，以排查可能的原
+[Investigator]  step 1: 结果 = [错误] Pod cce-system/cce-system/node-debug-y6yw 不存在: (404)
+Reason: Not Found
+HTTP response headers: HTTPHeaderDict({'Cach...
+[Investigator] 共调用 2 次工具
+[Investigator] 结论: Pod cce-system/node-debug-y6yw 不存在，无法获取日志。建议检查命名空间和Pod名称是否正确，或者该Pod是否已被删除。 (置信度: 低; 关键证据: Pod cce-system/node-debug-y6yw 不存在)
+[Remediator] 开始生成修复计划
+[Remediator] 修复计划: action=none safety=N/A target=
+[Approval] - decision=skip reason=no action needed
+
+======================================================================
+[!]  ALERT NOTIFICATION  severity=HIGH
+======================================================================
+label       : infra
+alert count : 1
+summary     : node-debug-y6yw节点上的cce-system命名空间下Pod频繁重启，共1420次。
+hypothesis  : Pod cce-system/node-debug-y6yw 不存在，无法获取日志。建议检查命名空间和Pod名称是否正确，或者该Pod是否已被删除。 (置信度: 低; 关键证据: Pod cce-system/node-debug-y6yw 不存在)
+----------------------------------------------------------------------
+REMEDIATION PLAN
+  action      : none
+  rationale   : Pod 不存在，无法确认具体问题，需要人工介入检查命名空间和Pod名称是否正确，或者该Pod是否已被删除。
+  rollback    : 无自动回滚操作，需要人工检查确认问题后再进行操作。
+----------------------------------------------------------------------
+APPROVAL GATE  : - SKIP
+  reason      : no action needed
+======================================================================
+
+----------------------------------------------------------------------
+[调度器] 诊断 7/7: kube-system/csi-rapidfsplugin-controller-server-8477bf4d8d-ddnx7 Unhealthy restarts=290
+----------------------------------------------------------------------
+[Triage] 清洗完成,共 1 条告警
+[Aggregator] 事件摘要: csi-rapidfsplugin-controller-server-8477bf4d8d-ddnx7 Pod 在 kube-system 命名空间内频繁重启，共290次。
+[Classifier] 分类: infra | 严重度: critical
+[Investigator] 开始诊断 (ReAct + 代码兜底)
+[Investigator]  step 0: 调用 get_pod_logs({'name': 'csi-rapidfsplugin-controller-server-8477bf4d8d-ddnx7', 'namespace': 'kube-system', 'lines': 30}) - 第一步必须调用 get_pod_logs 查看容器日志，以定位频繁重启的具体原因。
+[Investigator]  step 0: 结果 = === container: csi-provisioner ===
+--- 当前日志(最后 30 行) ---
+b'I0608 11:29:22.570606       1 leaderelection.go:278] successf...
+[Investigator] 共调用 1 次工具
+[Investigator] 结论: Pod 的频繁重启可能与 leader election 机制有关，但当前日志中没有显示具体的错误信息。需要进一步检查配置或依赖服务。 (置信度: 中; 关键证据: I0608 11:29:22.570606       1 leaderelection.go:278] successfully renewed lease kube-system/csi-rapidfsplugin)
+[Remediator] 开始生成修复计划
+[Remediator] 修复计划: action=none safety=N/A target=
+[Approval] - decision=skip reason=no action needed
+
+======================================================================
+[!!] ALERT NOTIFICATION  severity=CRITICAL
+======================================================================
+label       : infra
+alert count : 1
+summary     : csi-rapidfsplugin-controller-server-8477bf4d8d-ddnx7 Pod 在 kube-system 命名空间内频繁重启，共290次。
+hypothesis  : Pod 的频繁重启可能与 leader election 机制有关，但当前日志中没有显示具体的错误信息。需要进一步检查配置或依赖服务。 (置信度: 中; 关键证据: I0608 11:29:22.570606       1 leaderelection.go:278] successfully renewed lease kube-system/csi-rapidfsplugin)
+----------------------------------------------------------------------
+REMEDIATION PLAN
+  action      : none
+  rationale   : 当前没有足够的信息来确定问题原因，需要人工介入进行更详细的日志分析和配置检查。
+  rollback    : 无需回滚，等待人工分析结果。
+----------------------------------------------------------------------
+APPROVAL GATE  : - SKIP
+  reason      : no action needed
+======================================================================
+
+######################################################################
+# 巡检周期 70962f94 总结
+######################################################################
+[调度器] 集群异常总数: 50
+[调度器] 完成深度诊断: 7 组, 覆盖 24 个 Pod
+[调度器] 覆盖率: 48.0% (LLM 调用 7 次)
+
+  [1] [ccr-system] CrashLoopBackOff (影响 2 个 Pod, 代表: ccr-harbor-registry-68b7bcb984-tkxlz)
+      诊断: Pod ccr-harbor-registry-68b7bcb984-tkxlz 的 registry 容器因无法连接到外部服务 192.168.48.71:8080 导致 CrashLoopBackOff。 (置信度: 高; 关键证据: panic: execute http request failed! Retried 3 times, error: Get "http://192.168.
+      全组: ccr-harbor-registry-68b7bcb984-tkxlz, ccr-harbor-registry-75c547c587-pgcbn
+  [2] [kube-system] CrashLoopBackOff (影响 6 个 Pod, 代表: kube-external-auditor-192.168.48.78)
+      诊断: kube-external-auditor 容器启动时参数错误，缺少必需的配置文件路径。 (置信度: 高; 关键证据: flag provided but not defined: -kubeConfig)
+      全组: kube-external-auditor-192.168.48.78, kube-external-auditor-192.168.48.51, kube-external-auditor-192.168.48.76, device-plugin-patch-kdsct, dcgm-exporter-nxldn, ... (共 6 个)
+  [3] [noaheepro] CrashLoopBackOff (影响 2 个 Pod, 代表: noaheepro-rdma-agent-qpd5d)
+      诊断: rdma-agent 容器启动时因 undefined symbol 错误导致崩溃。 (置信度: 高; 关键证据: /home/ERI-Agent/bin/rdma-agent: symbol lookup error: /home/ERI-Agent/bin/rdma-agent: undefined symbol: nvmlDeviceGetCount)
+      全组: noaheepro-rdma-agent-qpd5d, noaheepro-noaheeops-task-manager-0
+  [4] [fluid-system] Unhealthy (影响 5 个 Pod, 代表: csi-nodeplugin-fluid-2-hkf8j)
+      诊断: Pod频繁重启的原因可能是csi-nodeplugin无法连接到csi.sock文件。 (置信度: 高; 关键证据: Still connecting to unix:///var/lib/kubelet/csi-plugins/fuse.csi.fluid.io/csi.sock)
+      全组: csi-nodeplugin-fluid-2-hkf8j, test-pvc-subpath, test-pvc-wmtest-a, test-pvc-wmtesta-ofb, node-debug-wmtest
+  [5] [noaheepro] Unhealthy (影响 6 个 Pod, 代表: noaheepro-agent-kd8rx)
+      诊断: Pod频繁重启的原因是与containerd通信失败，具体表现为连接refused错误。 (置信度: 高; 关键证据: connection error: desc = "transport: Error while dialing: dial unix /run/containerd/containerd.sock: connect: connection refused")
+      全组: noaheepro-agent-kd8rx, noaheepro-rdma-agent-sjl62, noaheepro-rdma-agent-cvfnq, noaheepro-rdma-agent-8hk6b, noaheepro-rdma-agent-9lwb9, ... (共 6 个)
+  [6] [cce-system] Unhealthy (影响 2 个 Pod, 代表: node-debug-y6yw)
+      诊断: Pod cce-system/node-debug-y6yw 不存在，无法获取日志。建议检查命名空间和Pod名称是否正确，或者该Pod是否已被删除。 (置信度: 低; 关键证据: Pod cce-system/node-debug-y6yw 不存在)
+      全组: node-debug-y6yw, node-debug-49-52
+  [7] [kube-system] Unhealthy (影响 1 个 Pod, 代表: csi-rapidfsplugin-controller-server-8477bf4d8d-ddnx7)
+      诊断: Pod 的频繁重启可能与 leader election 机制有关，但当前日志中没有显示具体的错误信息。需要进一步检查配置或依赖服务。 (置信度: 中; 关键证据: I0608 11:29:22.570606       1 leaderelection.go:278] successfully renewed lease kube-system/csi-rapidfsplugin)
+[调度器] 单次模式, 退出

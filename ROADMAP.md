@@ -43,9 +43,15 @@
   - Executor 双重校验 action 必须在 L3_ALLOWED_ACTIONS dict 内
   - remediation_actions 内部再校验资源真实状态 (必须真 Evicted 才删, 必须 RS/DS owner 才能 restart)
 - [x] **Executor T0/T2 状态快照** (前后 phase / restarts / containers ready 对比)
-- [x] **Validator 30s 同步健康检查** (Pod Ready + 重启不增长 → success)
+- [x] **Validator 30s 同步健康检查** (Pod Ready + 重启不增长 → success; restart_pod 后按 prefix 找控制器重建的新 Pod)
 - [x] **完整审计日志** (内存 deque, ApprovalGate / Executor / Validator 三阶段全记录)
 - [x] **Notifier 输出完整链路** (REMEDIATION PLAN / APPROVAL GATE / EXECUTION / VALIDATION 四段)
+- [x] **生产环境真实自愈验证**: 真删 Pod, 控制器 30s 内重建, Validator 识别新 Pod 并判定 success (双场景: ReplicaSet + DaemonSet)
+- [x] **IM 通知 + 本地审计** (`tools/im_notify.py`):
+  - 通用 IM 协议适配层 (如流 / 钉钉 / 企微 / 飞书 一键切换, 通过 `IM_PROVIDER` 环境变量)
+  - 关键事件自动推送群机器人 (critical/high/已执行/被拒, `should_push` 防刷屏)
+  - 同时写本地审计文件 `alerts/<timestamp>.txt` (防 IM 故障丢消息)
+  - `httpx` 10s 超时 + try/except 包裹, IM 故障不阻塞主流程
 
 ---
 

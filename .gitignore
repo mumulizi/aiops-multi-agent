@@ -39,6 +39,7 @@ nohup.out
 /data/
 /traces/
 /runs/
+/alerts/
 *.pkl
 *.bin
 

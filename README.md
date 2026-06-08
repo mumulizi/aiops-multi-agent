@@ -14,6 +14,8 @@
 - **Langfuse 全链路追踪**: 所有 Agent / 工具 / LLM 调用的 prompt / completion / token / 耗时全程可视化, 支持失败重放与性能分析
 - **自愈闭环 (v2.0)**: 9 节点完整流水线 (Inspector → Triage → Aggregator → Classifier → Investigator → **Remediator → ApprovalGate → Executor → Validator** → Notifier);
   L1-L4 安全分级 + 4 层安全保险 (大开关 / dry-run / 速率限制 / 业务时段); 三重防护避免 LLM 失误执行高风险动作
+- **IM 通知 + 本地审计**: 通用 IM 协议适配层 (如流 / 钉钉 / 企微 / 飞书 一键切换);
+  关键事件自动推送群机器人 (critical/high/已执行/被拒); 同时写本地审计文件 (alerts/) 防 IM 故障丢消息
 - **本地 LLM**: Qwen2.5-7B 在 2 卡 Tesla T4 上 vLLM TP=2 部署, OpenAI 兼容接口
 
 ## 架构
@@ -119,13 +121,15 @@ aiops-multi-agent/
 │   ├── approval_gate.py     # 安全分级路由 + 4 层保险 (v2.0)
 │   ├── executor.py          # 执行 Agent + T0/T2 快照 (v2.0)
 │   ├── validator.py         # 健康验证 Agent (v2.0)
-│   └── notifier.py          # 通知输出 (含完整自愈链路报告)
+│   └── notifier.py          # 通知输出 (含完整自愈链路报告 + IM 推送)
 ├── tools/                   # 工具集
 │   ├── k8s_tools.py         # K8s API 真实工具(异常列表/Pod详情/日志)
 │   ├── mock_tools.py        # Investigator 工具集 (PromQL/describe/历史/日志)
 │   ├── remediation_actions.py  # L3 白名单修复操作 (v2.0)
 │   ├── safety_guards.py     # 速率限制 + 审计日志 (v2.0)
+│   ├── im_notify.py         # IM 通知统一封装 (如流/钉钉/企微/飞书 + 本地审计)
 │   └── langfuse_setup.py    # Langfuse 统一配置 (callback + trace + TraceTimer)
+├── alerts/                  # 本地审计文件 (.gitignore 中忽略)
 ├── tests/                   # 单元/集成测试
 ├── graph.py                 # LangGraph 编排 (9 节点完整自愈流水线)
 ├── main_inspect.py          # 主入口: 巡检+诊断+自愈闭环
@@ -293,6 +297,56 @@ VALIDATION     : - skipped
 ======================================================================
 ```
 
+### 8. IM 推送 + 本地审计兜底
+
+通用 IM 通知层 (`tools/im_notify.py`) 适配 4 种 IM 协议, 通过环境变量切换:
+
+```bash
+# 一键切换 IM
+export IM_PROVIDER=infoflow      # infoflow / dingtalk / wecom / feishu
+export IM_WEBHOOK_URL='http://<im-api-host>/...?access_token=xxx'
+export IM_TOID='[群id]'           # 仅 infoflow 需要
+```
+
+**核心设计**:
+
+```python
+def send_message(text):
+    # 1. 永远先写本地审计文件 (alerts/<timestamp>.txt)
+    #    防 IM 故障导致告警丢失
+    write_local_audit(text)
+
+    # 2. POST 到 IM webhook (10s 超时, 失败不阻塞主流程)
+    try:
+        httpx.post(IM_WEBHOOK_URL, json=builders[IM_PROVIDER](text))
+    except Exception:
+        pass  # 永不抛异常
+```
+
+**防刷屏策略 (`should_push`)**: 仅对以下事件推送:
+- 严重度 critical / high
+- 真实执行过 (executed / failed) — 修复结果必须让人知道
+- L4 高危被拒 — 高风险动作被系统拦下需告警
+
+**IM 消息格式** (精简文本, 兼容所有 IM 协议):
+
+```
+🔴 [CRITICAL] AIOps 告警
+
+📍 <namespace> / <pod-name>
+📝 容器持续 CrashLoopBackOff
+🔍 根因: 后端服务连接被拒绝 (置信度: 高)
+🔧 修复方案: restart_pod (L3)
+🟢 安全门: ✓ 自动执行
+✅ 验证: 修复生效 (新 Pod ready=True)
+
+🆔 trace: a1b2c3d4
+```
+
+实际收到的群消息:
+
+![IM notification screenshot](images/im-notification.png)
+
 ## 运行环境要求
 
 - Python 3.10+ (实测 3.11)
@@ -385,6 +439,11 @@ export LANGFUSE_HOST="http://<your-langfuse-host>:3000"
 export AUTO_HEAL_ENABLED=true     # 大开关 (默认 false, 关闭时所有 L3 降级人审)
 export AUTO_HEAL_DRY_RUN=true     # 仅打印不真执行 (默认 true, 推荐保留直到充分验证)
 
+# IM 通知 (可选, 不设则只写本地 alerts/ 文件)
+export IM_PROVIDER=infoflow         # infoflow / dingtalk / wecom / feishu
+export IM_WEBHOOK_URL='http://<im-api-host>/...?access_token=xxx'
+export IM_TOID='[<group-id>]'        # 仅 infoflow 需要 (JSON 数组字符串)
+
 # 永久生效:
 # echo 'export LANGFUSE_PUBLIC_KEY="..."' >> ~/.bashrc
 ```
@@ -458,6 +517,8 @@ uv run python main_inspect.py --help
 - [x] Executor (T0 前快照 + T2 后快照, 三重校验防绕过, 完整审计日志)
 - [x] Validator (修复后 30s 健康检查, 自动判定 success/failed/skipped)
 - [x] 9 节点完整 LangGraph 流水线 (Triage → ... → Investigator → Remediator → ApprovalGate → Executor → Validator → Notifier)
+- [x] **生产环境真实自愈验证**: 真删 Pod, 控制器 30s 内重建, Validator 识别新 Pod 并判定 success
+- [x] **IM 通知 + 本地审计**: 通用 IM 协议层 (如流/钉钉/企微/飞书一键切换) + alerts/ 目录兜底
 
 **v1.2 计划**
 - [ ] 历史故障 Memory (LangMem 思路, MTTR ↓60%)

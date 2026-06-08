@@ -1,9 +1,11 @@
-"""Notifier Agent: 渲染告警卡片并打印 (后续可换飞书/钉钉).
+"""Notifier Agent: 渲染告警卡片并打印 (后续可换飞书/钉钉/如流).
 
 v2.0 升级: 输出 Inspector → Investigator → Remediator → Approval → Executor → Validator
 完整链路报告.
+v2.0+: 支持 IM 推送 (如流/钉钉/企微/飞书 + 本地审计文件兜底).
 """
 from agents.state import AlertState
+from tools.im_notify import send_message, format_alert_message, should_push
 
 
 _ICON = {
@@ -124,4 +126,16 @@ def notifier_node(state: AlertState) -> AlertState:
     state["notification_sent"] = True
     print()
     print(text)
+
+    # IM 推送 (默认仅对重要事件: critical/high/已执行/被拒)
+    if should_push(state):
+        im_text = format_alert_message(state)
+        result = send_message(im_text)
+        if result.get("im_sent"):
+            print(f"[Notifier] IM 推送成功 ({result.get('im_status')})", flush=True)
+        elif result.get("error"):
+            print(f"[Notifier] IM 推送失败: {result['error']}", flush=True)
+        if result.get("local_file"):
+            print(f"[Notifier] 本地审计: {result['local_file']}", flush=True)
+
     return state
