@@ -29,8 +29,11 @@ _L3_WHITELIST_DESC = """
 L3 自动白名单 (低风险, 可自动执行):
 - delete_evicted_pod: 删除 Evicted 状态的 Pod (清理类, 极安全)
 - delete_completed_job_pod: 删除 Succeeded 完成态 Pod
+- delete_failed_pod: 删除 Failed phase 的 Pod (含 Evicted 之外的失败情况)
 - restart_pod: 删除 Pod 让控制器重建 (允许 ReplicaSet 和 DaemonSet 管理的 Pod;
-  StatefulSet 因数据一致性走 L2)
+  StatefulSet 因数据一致性走 L2). 适用 CrashLoopBackOff / OOMKilled / 临时性故障.
+- restart_pod_for_image_pull: 重启 ImagePullBackOff/ErrImagePull 状态的 Pod
+  让控制器重新拉镜像 (允许 RS/DaemonSet). 注: 仅治标, 镜像名错/认证失效需改 Deployment.
 
 L2 人审灰名单 (中风险, 需人工确认):
 - scale_deployment: 调整 Deployment 副本数
@@ -45,6 +48,16 @@ L4 黑名单 (高危, 永远不自动执行):
 - update_image: 改 Deployment image
 
 action=none: 当前问题没有合适的安全操作, 需人工介入
+
+异常类型 → 推荐 action 速查:
+- CrashLoopBackOff (RS/DS owner) → restart_pod [L3]
+- CrashLoopBackOff (StatefulSet) → action=none (走 L2)
+- ImagePullBackOff / ErrImagePull → restart_pod_for_image_pull [L3]
+- OOMKilled → restart_pod [L3] (注: 治标, 限额需 L2)
+- Evicted (节点压力驱逐) → delete_evicted_pod [L3]
+- Failed (非 Evicted) → delete_failed_pod [L3]
+- Pending (调度失败 / 资源不足 / PVC pending) → action=none
+- 启动参数错 / 配置错 / 依赖服务 down → action=none
 """
 
 _SYSTEM_TPL = """你是 SRE 修复决策专家. 根据根因分析输出修复计划.
@@ -116,7 +129,7 @@ def _validate_plan(plan: dict) -> tuple:
 
     # 一致性校验: action 必须在对应 safety_level 的白名单/灰名单/黑名单
     l3_actions = set(ALLOWED_ACTIONS.keys())
-    l2_actions = {"scale_deployment", "evict_pod", "cordon_node"}
+    l2_actions = {"scale_deployment", "evict_pod", "cordon_node", "restart_statefulset_pod"}
     l4_actions = {"delete_pvc", "drain_node", "update_configmap", "update_image"}
 
     if action == "none":

@@ -131,46 +131,112 @@ def get_cluster_overview() -> str:
 
 
 def describe_pod_real(name: str, namespace: str) -> str:
+    """获取 Pod 完整描述, 含 message/conditions/last_terminated/events.
+
+    设计要点 (面向 LLM 排障):
+    - 完整保留 message 字段 (不截断 / 不截短) - 这是 ImagePullBackOff/Pending 的黄金信息
+    - 采集 last_terminated.message - 含崩溃前最后的关键输出
+    - 采集 conditions.message - Pending Pod 调度失败原因
+    - 采集 pod.status.message - Pod 整体状态信息
+    - 采集 image 列表 - 调试镜像问题必需
+    - 输出整体限制在 3000 字内, 优先保留 message 内容
+    """
     if not _kube_ok:
         return "[错误] K8s API 不可用"
     try:
         p = _v1.read_namespaced_pod(name=name, namespace=namespace)
     except Exception as e:
         return f"[错误] Pod {namespace}/{name} 查询失败: {e}"
+
     lines = [f"[Pod {namespace}/{name}]"]
-    lines.append(f"  phase: {p.status.phase}")
-    lines.append(f"  node: {p.spec.node_name}")
-    if p.status.container_statuses:
-        for cs in p.status.container_statuses:
-            cname = cs.name
-            ready = cs.ready
-            rs = cs.restart_count
-            lines.append(f"  container[{cname}] ready={ready} restarts={rs}")
-            if cs.state and cs.state.waiting:
-                wreason = cs.state.waiting.reason
-                wmsg = (cs.state.waiting.message or "")[:120]
-                lines.append(f"    waiting: {wreason} - {wmsg}")
+    lines.append(f"  phase    : {p.status.phase}")
+    lines.append(f"  node     : {p.spec.node_name or '(unscheduled)'}")
+
+    # Pod 整体 message / reason (常被忽视的黄金字段)
+    if p.status.message:
+        lines.append(f"  message  : {p.status.message}")
+    if p.status.reason:
+        lines.append(f"  reason   : {p.status.reason}")
+
+    # Pod conditions (Pending 调度失败原因在这)
+    if p.status.conditions:
+        abnormal = [c for c in p.status.conditions if c.status != "True" or c.message]
+        if abnormal:
+            lines.append("  conditions:")
+            for c in abnormal:
+                msg = c.message or ""
+                lines.append(
+                    f"    [{c.type}] {c.status} reason={c.reason or '-'}"
+                    + (f" msg={msg}" if msg else "")
+                )
+
+    # 镜像列表 (ImagePullBackOff 必备)
+    if p.spec.containers:
+        lines.append("  containers:")
+        for c in p.spec.containers:
+            lines.append(f"    - name={c.name} image={c.image}")
+    if p.spec.init_containers:
+        lines.append("  init_containers:")
+        for c in p.spec.init_containers:
+            lines.append(f"    - name={c.name} image={c.image}")
+
+    # 容器状态 (含完整 message + last_terminated)
+    def _add_statuses(statuses, label):
+        if not statuses:
+            return
+        lines.append(f"  {label}_statuses:")
+        for cs in statuses:
+            lines.append(f"    [{cs.name}] ready={cs.ready} restarts={cs.restart_count}")
+            if cs.state:
+                if cs.state.waiting:
+                    w = cs.state.waiting
+                    lines.append(f"      waiting: reason={w.reason or '-'}")
+                    if w.message:
+                        lines.append(f"        message: {w.message}")
+                elif cs.state.terminated:
+                    t = cs.state.terminated
+                    lines.append(
+                        f"      terminated: reason={t.reason or '-'} "
+                        f"exit_code={t.exit_code} signal={t.signal or '-'}"
+                    )
+                    if t.message:
+                        lines.append(f"        message: {t.message}")
+                elif cs.state.running:
+                    lines.append(f"      running: started_at={cs.state.running.started_at}")
             if cs.last_state and cs.last_state.terminated:
                 t = cs.last_state.terminated
-                treason = t.reason
-                texit = t.exit_code
-                lines.append(f"    last_terminated: {treason} exit={texit}")
+                lines.append(
+                    f"      last_terminated: reason={t.reason or '-'} "
+                    f"exit_code={t.exit_code} signal={t.signal or '-'}"
+                )
+                if t.message:
+                    lines.append(f"        message: {t.message}")
+
+    _add_statuses(p.status.init_container_statuses, "init_container")
+    _add_statuses(p.status.container_statuses, "container")
+
+    # 事件 (完整 message)
     try:
         events = _v1.list_namespaced_event(
             namespace=namespace,
             field_selector=f"involvedObject.name={name}",
-            limit=5,
+            limit=10,
         )
         if events.items:
-            lines.append("  最近事件:")
-            for e in events.items[-5:]:
-                etype = e.type
-                ereason = e.reason
-                emsg = (e.message or "")[:120]
+            lines.append("  events (recent 10):")
+            for e in events.items[-10:]:
+                etype = e.type or "-"
+                ereason = e.reason or "-"
+                emsg = e.message or ""
                 lines.append(f"    [{etype}] {ereason}: {emsg}")
     except Exception:
         pass
-    return "\n".join(lines)
+
+    full = "\n".join(lines)
+    # 整体限制 3000 字, 超出时截断并提示
+    if len(full) > 3000:
+        full = full[:2950] + "\n  ...(output truncated, original length=" + str(len(full)) + ")"
+    return full
 
 
 def collect_all_real_issues():
