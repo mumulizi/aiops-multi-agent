@@ -204,6 +204,7 @@ def should_push(state: dict) -> bool:
     - severity is critical or high
     - any real execution happened (executed / failed)
     - approval rejected high-risk action
+    - L2 human_review needs attention (pending approval)
     """
     sev = state.get("severity") or "low"
     if sev in ("critical", "high"):
@@ -211,6 +212,41 @@ def should_push(state: dict) -> bool:
     exec_status = state.get("execution_status")
     if exec_status in ("executed", "failed"):
         return True
-    if state.get("approval_decision") == "reject":
+    decision = state.get("approval_decision")
+    if decision in ("reject", "human_review"):
         return True
     return False
+
+
+def format_approval_message(approval_id: str, plan: dict, state: dict, ttl_min: int) -> str:
+    """Build an approval-request message with manual CLI commands."""
+    action = plan.get("action", "?")
+    target = plan.get("target", "?")
+    safety = plan.get("safety_level", "?")
+    rationale = plan.get("rationale", "")
+    rollback = plan.get("rollback", "")
+
+    sev = (state.get("severity") or "?").upper()
+    summary = state.get("event_summary", "")
+    rca = state.get("rca_hypothesis") or ""
+
+    lines = []
+    lines.append(f"⚠️  [APPROVAL NEEDED] L2 操作待审批")
+    lines.append(f"approval_id: {approval_id}    severity: {sev}    TTL: {ttl_min} 分钟")
+    lines.append("")
+    lines.append(f"📋 操作: {action}    target: {target}    safety: {safety}")
+    if summary:
+        lines.append(f"📝 事件: {summary}")
+    if rca:
+        rca_short = rca if len(rca) <= 200 else rca[:197] + "..."
+        lines.append(f"🔍 根因: {rca_short}")
+    if rationale:
+        lines.append(f"💡 修复理由: {rationale[:200]}")
+    if rollback and rollback not in ("n/a", "N/A"):
+        lines.append(f"⏪ 回滚方案: {rollback[:150]}")
+    lines.append("")
+    lines.append("=== 在服务器上执行 (项目目录) ===")
+    lines.append(f"批准: uv run python -m scripts.aiops_review approve {approval_id}")
+    lines.append(f"拒绝: uv run python -m scripts.aiops_review deny {approval_id}")
+    lines.append(f"详情: uv run python -m scripts.aiops_review show {approval_id}")
+    return "\n".join(lines)

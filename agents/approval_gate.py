@@ -4,7 +4,7 @@
 
 路由结果:
 - "executor"     → L3 自动执行
-- "human_review" → L2 推飞书等人审
+- "human_review" → L2 推 IM 等人审 + SQLite 持久化审批记录
 - "skip"         → action=none, 直接通知
 - "reject"       → L4 拒绝
 """
@@ -15,6 +15,8 @@ from datetime import datetime
 
 from agents.state import AlertState
 from tools.safety_guards import allow as rate_allow, record_audit
+from tools.approval_store import create_pending, DEFAULT_TTL_SEC
+from tools.im_notify import send_message, format_approval_message
 
 
 def _log(msg):
@@ -96,6 +98,18 @@ def approval_gate_node(state: AlertState) -> AlertState:
     state["approval_decision"] = decision
     state["approval_reason"] = reason
 
+    # 如果是 human_review, 写入 SQLite + 推 IM 审批通知
+    if decision == "human_review":
+        try:
+            approval_id = create_pending(plan, state)
+            state["approval_id"] = approval_id
+            ttl_min = DEFAULT_TTL_SEC // 60
+            msg = format_approval_message(approval_id, plan, state, ttl_min)
+            push_result = send_message(msg)
+            _log(f"[Approval]   approval_id={approval_id} 已推送 IM (sent={push_result.get('im_sent')})")
+        except Exception as e:
+            _log(f"[Approval]   ⚠ 创建审批记录失败: {e}")
+
     # 审计: 任何决策都写日志
     record_audit({
         "stage": "approval_gate",
@@ -105,6 +119,7 @@ def approval_gate_node(state: AlertState) -> AlertState:
         "safety_level": safety,
         "decision": decision,
         "reason": reason,
+        "approval_id": state.get("approval_id"),
     })
 
     icon = {"executor": "✓", "human_review": "?", "skip": "-", "reject": "✗"}.get(decision, "?")

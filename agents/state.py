@@ -25,6 +25,8 @@ class AlertState(TypedDict, total=False):
     # Approval Gate 决策: "executor" | "human_review" | "skip" | "reject"
     approval_decision: Optional[str]
     approval_reason: Optional[str]
+    # human_review 时写入的审批 ID (CLI 审批用)
+    approval_id: Optional[str]
 
     # === Executor 写 (Phase 3) ===
     execution_status: Optional[Literal["executed", "skipped", "failed", "rejected", "dry_run"]]
