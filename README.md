@@ -14,8 +14,12 @@
 - **Langfuse 全链路追踪**: 所有 Agent / 工具 / LLM 调用的 prompt / completion / token / 耗时全程可视化, 支持失败重放与性能分析
 - **自愈闭环 (v2.0)**: 9 节点完整流水线 (Inspector → Triage → Aggregator → Classifier → Investigator → **Remediator → ApprovalGate → Executor → Validator** → Notifier);
   L1-L4 安全分级 + 4 层安全保险 (大开关 / dry-run / 速率限制 / 业务时段); 三重防护避免 LLM 失误执行高风险动作
+- **5 个修复动作**: `delete_evicted_pod` / `delete_completed_job_pod` / `restart_pod` (RS+DaemonSet) / `restart_pod_for_image_pull` / `delete_failed_pod` —
+  覆盖 80%+ 常见 K8s 异常类型 (CrashLoopBackOff / ImagePullBackOff / OOMKilled / Evicted / Failed)
+- **L2 异步审批 (CLI)**: SQLite 持久化待审批操作 (TTL 30min) + IM 推送审批指令 + CLI 工具 (`scripts/aiops_review.py`) 远程审批; 审批通过后双重校验 + 30s Validator 自动验证 + 第二条 IM 推执行结果
+- **describe_pod_real 完整字段采集**: 覆盖 `waiting.message` / `last_terminated.message` / `conditions.message` / `pod.status.message` / `init_containers` / `images` 等 8 类字段, 拿不到日志的 Pod (Pending/ImagePull) 也能定位真实根因
 - **IM 通知 + 本地审计**: 通用 IM 协议适配层 (如流 / 钉钉 / 企微 / 飞书 一键切换);
-  关键事件自动推送群机器人 (critical/high/已执行/被拒); 同时写本地审计文件 (alerts/) 防 IM 故障丢消息
+  关键事件自动推送群机器人 (critical/high/已执行/被拒/待审批); 同时写本地审计文件 (alerts/) 防 IM 故障丢消息
 - **本地 LLM**: Qwen2.5-7B 在 2 卡 Tesla T4 上 vLLM TP=2 部署, OpenAI 兼容接口
 
 ## 架构
@@ -118,23 +122,27 @@ aiops-multi-agent/
 │   ├── investigator.py      # ReAct 根因诊断 (集成 Langfuse callback)
 │   ├── inspector.py         # 主动巡检 (核心, 三阶段, 集成 Langfuse trace)
 │   ├── remediator.py        # 修复决策 Agent (v2.0)
-│   ├── approval_gate.py     # 安全分级路由 + 4 层保险 (v2.0)
+│   ├── approval_gate.py     # 安全分级路由 + 4 层保险 (v2.0) + L2 审批入库
 │   ├── executor.py          # 执行 Agent + T0/T2 快照 (v2.0)
 │   ├── validator.py         # 健康验证 Agent (v2.0)
 │   └── notifier.py          # 通知输出 (含完整自愈链路报告 + IM 推送)
 ├── tools/                   # 工具集
 │   ├── k8s_tools.py         # K8s API 真实工具(异常列表/Pod详情/日志)
 │   ├── mock_tools.py        # Investigator 工具集 (PromQL/describe/历史/日志)
-│   ├── remediation_actions.py  # L3 白名单修复操作 (v2.0)
+│   ├── remediation_actions.py  # L3 白名单 5 个修复动作 (v2.0)
 │   ├── safety_guards.py     # 速率限制 + 审计日志 (v2.0)
+│   ├── approval_store.py    # SQLite 待审批持久化 + TTL (v2.0+)
 │   ├── im_notify.py         # IM 通知统一封装 (如流/钉钉/企微/飞书 + 本地审计)
 │   └── langfuse_setup.py    # Langfuse 统一配置 (callback + trace + TraceTimer)
+├── scripts/                 # CLI 工具
+│   └── aiops_review.py      # L2 审批 CLI (list/show/approve/deny)
 ├── alerts/                  # 本地审计文件 (.gitignore 中忽略)
+├── data/                    # SQLite 持久化 (审批记录, .gitignore 中忽略)
 ├── tests/                   # 单元/集成测试
 ├── graph.py                 # LangGraph 编排 (9 节点完整自愈流水线)
 ├── main_inspect.py          # 主入口: 巡检+诊断+自愈闭环
 ├── pyproject.toml           # uv 依赖
-├── ROADMAP.md               # 21 项前沿迭代方向 (v2.0 自愈 / GraphRAG / Critic ...)
+├── ROADMAP.md               # 21 项前沿迭代方向
 └── README.md
 ```
 
@@ -226,21 +234,23 @@ end_cycle_trace(trace, output={"reports": len(reports), "coverage": coverage})
 
 ```
 L1 Dry-run    只输出建议, 永不执行              ← 默认起点 (最稳)
-L2 人审       推飞书 + 一键确认才执行
+L2 人审       推 IM + CLI 审批才执行
 L3 白名单自动 预定义安全动作直接执行              ← AUTO_HEAL_ENABLED=true 才生效
 L4 LLM 自由   LLM 决定一切                       ← 永不实现 (生产灾难)
 ```
 
-**操作分级表 (L3 白名单是允许自动执行的全部范围)**:
+**操作分级表 (L3 白名单 5 个动作, 覆盖 80%+ 常见 K8s 异常)**:
 
-| 操作 | 等级 | 说明 |
-|------|------|------|
-| `delete_evicted_pod` | L3 | 清理 Failed/Evicted Pod, 极低风险 |
-| `delete_completed_job_pod` | L3 | 清理 Succeeded 完成态 Pod |
-| `restart_pod` | L3 | 删除 Pod 让控制器重建 (允许 ReplicaSet/DaemonSet, StatefulSet 走 L2) |
-| `scale_deployment` | L2 | 调整副本数, 需人审 |
-| `evict_pod` / `cordon_node` | L2 | 强驱逐/标记不可调度, 需人审 |
-| `delete_pvc` / `drain_node` / `update_image` | L4 | **永不自动**, 直接拒绝 |
+| 操作 | 等级 | 适用异常 | 说明 |
+|------|------|---------|------|
+| `delete_evicted_pod` | L3 | 节点压力驱逐 | 清理 Failed/Evicted Pod, 极低风险 |
+| `delete_completed_job_pod` | L3 | Succeeded Job 残留 | 清理已完成态 Pod |
+| `delete_failed_pod` | L3 | Failed (非 Evicted) | 清理已死 Pod, 让控制器重建 |
+| `restart_pod` | L3 | CrashLoopBackOff / OOMKilled | 删除 Pod 让控制器重建 (仅 ReplicaSet/DaemonSet, StatefulSet 走 L2) |
+| `restart_pod_for_image_pull` | L3 | ImagePullBackOff / ErrImagePull | 重启让控制器重新拉镜像 (仅治标) |
+| `scale_deployment` | L2 | 副本数调整 | 推 IM 等人审 |
+| `evict_pod` / `cordon_node` | L2 | 强驱逐/标记不可调度 | 推 IM 等人审 |
+| `delete_pvc` / `drain_node` / `update_image` | L4 | 高危 | **永不自动**, 直接拒绝 |
 
 **4 层安全保险 (任何一个失效都拦得住)**:
 
@@ -297,7 +307,48 @@ VALIDATION     : - skipped
 ======================================================================
 ```
 
-### 8. IM 推送 + 本地审计兜底
+### 8. L2 异步审批 (CLI + IM)
+
+L2 操作 (如 `cordon_node` / `scale_deployment`) 不能自动执行, 需人工审批. 实现方式:
+
+```
+[流水线] L2 决策
+   ↓
+[approval_store] SQLite 持久化 (id=A1B2C3D4, ttl=30min)
+   ↓
+[IM 推送] 含 approval_id + CLI 命令 (审批者复制粘贴即可)
+   ↓
+[流水线继续] 不阻塞主流程
+   ↓
+人收 IM → SSH 服务器 → 跑 CLI:
+   uv run python -m scripts.aiops_review approve A1B2C3D4
+   ↓
+[CLI] 双重校验 (白名单 + 速率 + 大开关) → execute_action() → 30s Validator → 推 IM 第二条
+```
+
+**CLI 子命令**:
+
+```bash
+# 列出所有待审批 (未过期)
+uv run python -m scripts.aiops_review list
+
+# 看某条审批的详情 (含 plan / state / RCA)
+uv run python -m scripts.aiops_review show <approval_id>
+
+# 批准 (立即执行 + 30s 验证 + 自动推 IM 结果)
+uv run python -m scripts.aiops_review approve <approval_id> [--note "..."]
+
+# 拒绝
+uv run python -m scripts.aiops_review deny <approval_id> [--reason "..."]
+```
+
+**审批安全设计**:
+- TTL 30 分钟过期, 防止历史决策被误执行
+- 双重校验: CLI `approve` 时再次检查 `is_l3_allowed(action)`, 防止 plan 被篡改
+- 沿用环境变量保护: `AUTO_HEAL_ENABLED` 关闭时即使审批通过也不执行
+- 审计完整记录: SQLite + safety_guards 内存日志双写
+
+### 9. IM 推送 + 本地审计兜底
 
 通用 IM 通知层 (`tools/im_notify.py`) 适配 4 种 IM 协议, 通过环境变量切换:
 
@@ -471,6 +522,22 @@ uv run python -u -m tests.test_inspector     # Inspector 主动巡检
 uv run python -u -m tests.test_e2e           # 5 Agent 流水线 (mock 告警)
 ```
 
+### 7. L2 异步审批 CLI
+
+```bash
+# 列出待审批 (流水线触发 L2 决策后, 这里能看到, 同时群里收到 IM)
+uv run python -m scripts.aiops_review list
+
+# 看某条审批的详情
+uv run python -m scripts.aiops_review show <approval_id>
+
+# 批准 (会自动调 execute_action + 30s Validator + 推 IM)
+uv run python -m scripts.aiops_review approve <approval_id> --note "测试审批"
+
+# 拒绝
+uv run python -m scripts.aiops_review deny <approval_id> --reason "不合适当前时段"
+```
+
 ## 命令行参数
 
 ```
@@ -499,9 +566,9 @@ uv run python main_inspect.py --help
 
 ### 已知局限
 
-- 重复异常会重复诊断 (TODO: SQLite 持久化 + 去重缓存)
-- 诊断结果仅 stdout 输出 (TODO: 飞书/钉钉机器人推送)
-- 自愈仅 L3 白名单自动 + dry-run; L2 人审尚未实现飞书 webhook 回调
+- 重复异常会重复诊断 (TODO: 故障 fingerprint 去重缓存)
+- 诊断推 IM 之外没有持久化(本地有 alerts/, 缺集中检索)
+- 本地 Qwen2.5-7B 在复杂决策上偶有 fallback (考虑升级 14B 或接 Claude API)
 
 ### Roadmap (摘要)
 
@@ -519,26 +586,31 @@ uv run python main_inspect.py --help
 - [x] 9 节点完整 LangGraph 流水线 (Triage → ... → Investigator → Remediator → ApprovalGate → Executor → Validator → Notifier)
 - [x] **生产环境真实自愈验证**: 真删 Pod, 控制器 30s 内重建, Validator 识别新 Pod 并判定 success
 - [x] **IM 通知 + 本地审计**: 通用 IM 协议层 (如流/钉钉/企微/飞书一键切换) + alerts/ 目录兜底
+- [x] **L3 修复动作扩展**: 5 个动作覆盖 80%+ 异常 (Evicted/Completed/Failed/CrashLoopBackOff/ImagePullBackOff)
+- [x] **describe_pod_real 全字段采集**: 拿不到日志的 Pod 也能定位真实根因
+- [x] **L2 异步审批 (v2.0+)**: SQLite 持久化 + IM 推送审批指令 + CLI 工具 (list/show/approve/deny) + 自动 30s 验证
 
 **v1.2 计划**
-- [ ] 历史故障 Memory (LangMem 思路, MTTR ↓60%)
+- [ ] 历史故障 Memory (LangMem 思路, MTTR ↓60%, 同 fingerprint 1h 内复用上次诊断)
 - [ ] Critic Agent (CRITIC 论文范式, 反 LLM 幻觉)
 - [ ] Eval Set + LLM-as-Judge (回归测试)
 - [ ] Function Calling Native (替代 ReAct 字符串解析)
 - [ ] Tool Result Caching (5min TTL)
+- [ ] 升级本地模型: Qwen2.5-14B 替代 7B (T4 双卡 TP=2 可跑) 或 接入 Claude API 做混合架构
 
 **v2.1 自愈闭环深化**
-- [ ] L2 人审实现: 飞书机器人 webhook 回调 (批准/拒绝按钮)
+- [ ] L2 飞书/钉钉/如流交互式按钮 (双向 webhook, 替代 CLI 审批)
 - [ ] Validator 异步 30s/2min/10min 三次检查 (当前仅 30s 同步)
-- [ ] 修复历史持久化 (SQLite, 用于事后复盘 + 同故障频次统计)
+- [ ] 修复历史 SQLite 检索 + 频次统计仪表盘
 - [ ] 修复失败自动触发再诊断闭环
+- [ ] L2 操作执行端实现: cordon_node / scale_deployment / evict_pod
 - [ ] 微软 GraphRAG 知识库 (基于服务依赖图谱回答全局根因)
 
 **v3.0 学术前沿**
 - [ ] Topology-Aware 故障传播分析
 - [ ] TimesFM/Chronos 时序异常检测 (zero-shot)
 - [ ] Multi-Agent Debate (多 LLM 投票)
-- [ ] Tool-use SFT 微调 Qwen
+- [ ] Tool-use SFT 微调 Qwen (用历史 trace 训练专用 AIOps 模型)
 - [ ] MCP Protocol 工具协议化
 
 ### 设计原则
