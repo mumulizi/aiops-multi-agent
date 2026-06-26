@@ -3,9 +3,11 @@
 v2.0 升级: 输出 Inspector → Investigator → Remediator → Approval → Executor → Validator
 完整链路报告.
 v2.0+: 支持 IM 推送 (如流/钉钉/企微/飞书 + 本地审计文件兜底).
+v2.8: 标题加上 region 标识符 (多集群部署), 通过 REGION 环境变量配置.
 """
 from agents.state import AlertState
 from tools.im_notify import send_message, format_alert_message, should_push
+from tools.llm_factory import get_region
 
 
 _ICON = {
@@ -41,11 +43,13 @@ def notifier_node(state: AlertState) -> AlertState:
 
     icon = _ICON.get(sev, "[*] ")
     sev_upper = sev.upper() if isinstance(sev, str) else "?"
+    region = get_region()
 
     lines = [
         "=" * 70,
-        f"{icon} ALERT NOTIFICATION  severity={sev_upper}",
+        f"{icon} ALERT NOTIFICATION  [{region}] severity={sev_upper}",
         "=" * 70,
+        f"region      : {region}",
         f"label       : {label}",
         f"alert count : {count}",
         f"summary     : {summary}",

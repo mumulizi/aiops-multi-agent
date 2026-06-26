@@ -5,9 +5,12 @@ from collections import Counter
 try:
     config.load_kube_config()
     _v1 = client.CoreV1Api()
+    _apps_v1 = client.AppsV1Api()  # Deployment / StatefulSet / DaemonSet 操作
     _kube_ok = True
 except Exception as e:
     print(f"[k8s_tools] kubeconfig 加载失败: {e}")
+    _v1 = None
+    _apps_v1 = None
     _kube_ok = False
 
 # 全局缓存: Inspector 阶段 3 直接拿真实结构化数据
@@ -18,7 +21,16 @@ _DISCOVERED = {
 
 
 def _query_unhealthy_pods_raw():
-    """内部: 返回完整异常 Pod 结构化列表 (生产用主接口)"""
+    """内部: 返回完整异常 Pod 结构化列表 (生产用主接口).
+
+    "异常" 判定 (满足任一):
+    1. phase 不是 Running/Succeeded (Failed/Pending/Unknown)
+    2. 当前有容器处于 waiting 状态 (CrashLoopBackOff/ImagePullBackOff/Error/...)
+    3. 当前有容器 not ready
+
+    注意: 单纯历史 restart 数高 + 当前正常运行的 Pod 不算异常.
+    这种 Pod 可能是早期不稳定但现在已稳定, 不需要打扰.
+    """
     if not _kube_ok:
         return []
     pods = _v1.list_pod_for_all_namespaces(timeout_seconds=20).items
@@ -29,10 +41,15 @@ def _query_unhealthy_pods_raw():
         name = p.metadata.name
         restart_total = 0
         reasons = []
+        has_waiting = False        # 当前是否有容器卡在 waiting (真实持续故障)
+        any_not_ready = False      # 当前是否有容器 not ready
         if p.status.container_statuses:
             for cs in p.status.container_statuses:
                 restart_total += cs.restart_count or 0
+                if not cs.ready:
+                    any_not_ready = True
                 if cs.state and cs.state.waiting:
+                    has_waiting = True
                     r = cs.state.waiting.reason
                     if r:
                         reasons.append(r)
@@ -40,8 +57,31 @@ def _query_unhealthy_pods_raw():
                     r = cs.last_state.terminated.reason
                     if r:
                         reasons.append(f"last:{r}")
-        is_unhealthy = phase not in ("Running", "Succeeded") or restart_total >= 3
+        # v2.5: 异常判定收紧.
+        # 旧版: phase 异常 或 restart>=3 都算异常 → 过于灵敏, Running+restart 高的"
+        #   稳定 Pod"会反复进流水线.
+        # 新版: 只看"当前是否真的在故障":
+        #   - phase Failed/Pending/Unknown (不是 Running)
+        #   - 或当前有容器 waiting (CrashLoop/ImagePull 等持续故障状态)
+        #   - 或容器 not ready (健康检查失败等)
+        # restart 数仅用作 severity 分级, 不再作为"是否异常"的判据.
+        is_unhealthy = (
+            phase not in ("Running", "Succeeded")
+            or has_waiting
+            or any_not_ready
+        )
         if is_unhealthy:
+            # 提取 owner_kind, 用于 Remediator 判断该走哪种修复路径
+            # 只承认 K8s 真正的控制器 kind, 其他 (含 Node 静态 Pod) 都当 BarePod
+            VALID_CONTROLLERS = {"ReplicaSet", "DaemonSet", "StatefulSet", "Job"}
+            owners = p.metadata.owner_references or []
+            owner_kind = "BarePod"  # 默认: 无 owner / Node 静态 Pod / 不识别的 kind
+            for o in owners:
+                # 必须是 controller=true 且 kind 在白名单
+                is_controller = getattr(o, "controller", False)
+                if is_controller and o.kind in VALID_CONTROLLERS:
+                    owner_kind = o.kind
+                    break
             unhealthy.append({
                 "namespace": ns,
                 "pod": name,
@@ -49,8 +89,21 @@ def _query_unhealthy_pods_raw():
                 "restarts": restart_total,
                 "reason": ";".join(reasons) if reasons else "(no reason)",
                 "node": p.spec.node_name or "",
+                "owner_kind": owner_kind,
             })
-    unhealthy.sort(key=lambda x: x["restarts"], reverse=True)
+    # 排序: 先按"是否卡死状态" (ImagePullBackOff/ConfigError 等永不自愈),
+    # 再按 restart 数. 这样 restart=0 但卡死的 Pod 不会被埋在末尾.
+    _NON_HEALING_KEYWORDS = (
+        "imagepull", "errimage", "imagebackoff", "invalidimage",
+        "createcontainerconfigerror", "createcontainererror",
+        "runcontainererror", "configerror",
+    )
+
+    def _is_stuck(item):
+        r = (item.get("reason") or "").lower()
+        return 1 if any(kw in r for kw in _NON_HEALING_KEYWORDS) else 0
+
+    unhealthy.sort(key=lambda x: (_is_stuck(x), x["restarts"]), reverse=True)
     return unhealthy
 
 
@@ -252,163 +305,67 @@ def get_discovered_cache():
     }
 
 
-def get_pod_logs(name: str, namespace: str, lines: int = 50, previous: bool = True) -> str:
+def get_pod_logs(name: str, namespace: str, lines: int = 50,
+                 previous: bool = True) -> str:
+    """读取 Pod 所有容器的日志 (含 init containers + 上次崩溃前日志).
 
-
-    """读取 Pod 容器日志 (含上次崩溃前的)"""
-
-
+    v2.5 升级:
+    - 同时遍历 p.spec.containers 和 p.spec.init_containers
+    - 任何容器读取失败都显式提示 (NotFound / 权限 / 网络)
+    - 单容器日志限制 3000 字, 多容器累计才不会爆 LLM 上下文
+    """
     if not _kube_ok:
-
-
         return "[错误] K8s API 不可用"
-
-
     try:
-
-
         p = _v1.read_namespaced_pod(name=name, namespace=namespace)
-
-
     except Exception as e:
-
-
         return f"[错误] Pod {namespace}/{name} 不存在: {e}"
 
-
-
-
-
-    if not p.spec.containers:
-
-
+    main_containers = list(p.spec.containers or [])
+    init_containers = list(p.spec.init_containers or [])
+    if not main_containers and not init_containers:
         return "[错误] Pod 无 container 定义"
 
-
-
-
-
     out_lines = []
+    out_lines.append(
+        f"[Pod {namespace}/{name}] containers={len(main_containers)} "
+        f"init_containers={len(init_containers)}"
+    )
 
-
-    for c in p.spec.containers:
-
-
-        cname = c.name
-
-
-        out_lines.append(f"=== container: {cname} ===")
-
-
-        # 当前日志
-
-
+    def _read_container_logs(cname, label):
+        out_lines.append(f"\n=== {label}: {cname} ===")
         try:
-
-
             current = _v1.read_namespaced_pod_log(
-
-
-                name=name,
-
-
-                namespace=namespace,
-
-
-                container=cname,
-
-
-                tail_lines=lines,
-
-
-                _request_timeout=10,
-
-
+                name=name, namespace=namespace, container=cname,
+                tail_lines=lines, _request_timeout=10,
             )
-
-
             if current:
-
-
-                out_lines.append("--- 当前日志(最后 {0} 行) ---".format(lines))
-
-
-                out_lines.append(current.strip()[:2000])
-
-
+                out_lines.append(f"--- 当前日志(最后 {lines} 行) ---")
+                out_lines.append(current.strip()[:3000])
             else:
-
-
                 out_lines.append("(当前日志为空)")
-
-
         except Exception as e:
-
-
-            out_lines.append(f"(当前日志读取失败: {e})")
-
-
-
-
-
-        # 上次崩溃前的日志(关键!)
-
+            out_lines.append(f"(当前日志读取失败: {str(e)[:120]})")
 
         if previous:
-
-
             try:
-
-
                 prev = _v1.read_namespaced_pod_log(
-
-
-                    name=name,
-
-
-                    namespace=namespace,
-
-
-                    container=cname,
-
-
-                    previous=True,
-
-
-                    tail_lines=lines,
-
-
-                    _request_timeout=10,
-
-
+                    name=name, namespace=namespace, container=cname,
+                    previous=True, tail_lines=lines, _request_timeout=10,
                 )
-
-
                 if prev:
-
-
-                    out_lines.append("--- 上次崩溃前日志(最后 {0} 行) ---".format(lines))
-
-
-                    out_lines.append(prev.strip()[:2000])
-
-
+                    out_lines.append(f"--- 上次崩溃前日志(最后 {lines} 行) ---")
+                    out_lines.append(prev.strip()[:3000])
             except Exception as e:
-
-
                 msg = str(e)
-
-
                 if "previous terminated container" in msg or "not found" in msg:
-
-
-                    pass  # 没有 previous 日志属正常
-
-
+                    pass
                 else:
+                    out_lines.append(f"(上次日志读取失败: {msg[:120]})")
 
-
-                    out_lines.append(f"(上次日志读取失败: {msg[:80]})")
-
+    for c in init_containers:
+        _read_container_logs(c.name, "init container")
+    for c in main_containers:
+        _read_container_logs(c.name, "container")
 
     return "\n".join(out_lines)

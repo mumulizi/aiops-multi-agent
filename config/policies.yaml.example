@@ -1,0 +1,50 @@
+# 巡检忽略策略
+#
+# 列表里任一规则匹配 → 该 Pod 不进流水线 (Inspector 收集到也跳过).
+# 改完不需要重启, 每轮巡检自动重新加载.
+#
+# 三种规则形式 (按需混用):
+#   1. namespace + pod          → 精确忽略某个 Pod
+#   2. namespace + pod_pattern  → glob 通配 (* 任意, ? 单字符)
+#   3. namespace 单独           → 整个 namespace 忽略
+#
+# 文件路径可以通过环境变量 POLICIES_FILE 覆盖, 默认就是这个文件.
+# CLI: uv run python -u main_inspect.py --policies path/to/your.yaml
+#
+# === pod_pattern 写法 (重要, 用 fnmatch glob) ===
+# pod 名是 "kube-external-auditor-192.168.48.78"
+#   - "kube-external-auditor-*"   ✓ 命中 (服务名开头, 匹配尾部 hash/IP)
+#   - "*kube-external-auditor*"   ✓ 命中 (包含即可)
+#   - "*-kube-external-auditor-*" ✗ 不命中 (要求前面必须有 -)
+#
+# pod 名是 "my-app-rs-7466749c9f-q98kw" (Deployment Pod)
+#   - "my-app-*"                  ✓ 命中
+#   - "my-app-rs-*-q98kw"         ✓ 命中 (* 跨 - 也行)
+#
+# 大小写敏感. 多用 "服务名-*" 这种简单形式即可.
+
+ignores:
+  # === 整 namespace 忽略 ===
+  # - namespace: "monitoring"
+  #   reason: "由监控团队独立维护"
+  #
+  # - namespace: "kube-public"
+  #   reason: "K8s 系统 ns, 由 SRE 直管"
+
+  # === namespace + 精确 pod 名 ===
+  # - namespace: "default"
+  #   pod: "my-known-broken-pod"
+  #   reason: "已知配置问题, 等下次发版修"
+
+  # === namespace + pod 通配符 (glob) ===
+  # - namespace: "kube-system"
+  #   pod_pattern: "kube-external-auditor-*"
+  #   reason: "已知 bug, 等运维修启动参数"
+  #
+  # - namespace: "ci"
+  #   pod_pattern: "*-test-*"
+  #   reason: "CI 临时 Pod"
+  #
+  # - namespace: "load-test"
+  #   pod_pattern: "load-*"
+  #   reason: "压测 Pod, 故意制造异常"

@@ -131,8 +131,12 @@ def format_alert_message(state: dict) -> str:
 
     icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}.get(sev, "⚪")
 
+    # v2.8: 多集群部署区分告警来源 (REGION 环境变量, 默认 "default")
+    from tools.llm_factory import get_region
+    region = get_region()
+
     lines = []
-    lines.append(f"{icon} [{sev}] AIOps 告警")
+    lines.append(f"{icon} [{sev}] [{region}] AIOps 告警")
     lines.append("")
 
     # Pull namespace+pod from raw_alerts if present

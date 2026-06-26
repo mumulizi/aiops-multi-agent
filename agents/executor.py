@@ -52,9 +52,39 @@ def executor_node(state: AlertState) -> AlertState:
         _log("[Executor] - skipped (kill switch off)")
         return state
 
-    # T0: 执行前快照
+    # T-1: target 实存性预检 (防御 LLM 幻觉 / Approval 漏校验)
+    # 不同 action 的 target 形态不同, 只对 Pod 操作做存在性预检.
+    # cordon_node / scale_deployment / rollback_deployment 由各自的 action 函数自检.
+    POD_LEVEL_ACTIONS = {
+        "delete_evicted_pod", "delete_completed_job_pod", "delete_failed_pod",
+        "restart_pod", "restart_pod_for_image_pull", "restart_statefulset_pod",
+    }
     ns, name = _split_target(target)
-    if ns and name:
+    if action in POD_LEVEL_ACTIONS and ns and name:
+        try:
+            from kubernetes import client, config as k8s_config
+            try:
+                k8s_config.load_incluster_config()
+            except Exception:
+                k8s_config.load_kube_config()
+            client.CoreV1Api().read_namespaced_pod(name, ns)
+        except Exception as e:
+            status = getattr(e, "status", None)
+            if status == 404:
+                state["execution_status"] = "aborted"
+                state["execution_log"] = f"target {target} 不存在 (404), 拒绝执行 (LLM 幻觉?)"
+                _log(f"[Executor] ✗ aborted: {state['execution_log']}")
+                record_audit({
+                    "stage": "executor", "trace_id": state.get("trace_id"),
+                    "action": action, "target": target,
+                    "result": "aborted_target_not_found",
+                })
+                return state
+            # 其他异常 (权限/网络) 不应阻止执行, 让 execute_action 自己报错
+            _log(f"[Executor] ⚠ target 预检异常 (非 404): {e}, 继续执行")
+
+    # T0: 执行前快照 (仅对 Pod 操作快照, 节点/Deployment 操作没有 Pod 状态可比)
+    if action in POD_LEVEL_ACTIONS and ns and name:
         snap_before = _capture_pod_state(ns, name)
         state["snapshot_before"] = snap_before
         _log(f"[Executor] T0 snapshot: phase={snap_before.get('phase')} "
@@ -66,7 +96,14 @@ def executor_node(state: AlertState) -> AlertState:
     # T1: 执行
     dry_run = _is_dry_run()
     _log(f"[Executor] executing action={action} target={target} dry_run={dry_run}")
-    result = execute_action(action, target, dry_run=dry_run)
+    # scale_deployment 需要从 plan.extra 拿 delta / replicas
+    extra = (plan.get("extra") or {}) if isinstance(plan.get("extra"), dict) else {}
+    if action == "scale_deployment":
+        result = execute_action(action, target, dry_run=dry_run, **{
+            k: v for k, v in extra.items() if k in ("replicas", "delta")
+        })
+    else:
+        result = execute_action(action, target, dry_run=dry_run)
 
     if result.get("dry_run"):
         state["execution_status"] = "dry_run"

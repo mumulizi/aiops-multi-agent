@@ -53,6 +53,784 @@
   - 同时写本地审计文件 `alerts/<timestamp>.txt` (防 IM 故障丢消息)
   - `httpx` 10s 超时 + try/except 包裹, IM 故障不阻塞主流程
 
+#### 🎯 v2.0 真实集群跑通成果
+
+一次完整巡检周期 (数十个真实异常 Pod, Top N 同类去重后) 的 5/5 决策全部正确:
+
+| Pod 类型 (代表) | Owner | Plan | 决策路径 | 实际结果 |
+|-----|-----|-----|-----|-----|
+| 静态 Pod 实例 ×3 | BarePod | action=none | SKIP (LLM 自动遵循 Owner 铁律) | ✅ 不动裸 Pod |
+| 某 StatefulSet 实例 | StatefulSet | restart_statefulset_pod L2 | human_review → IM 推审批 | ✅ CLI approve 后真重启 |
+| 某 CSI DaemonSet 实例 | DaemonSet | restart_pod L3 | AUTO | ✅ 删→重建→ready=True |
+| 某监控 DaemonSet 实例 | DaemonSet | restart_pod L3 | AUTO | ✅ 删→重建 |
+| 某 debug 类裸 Pod | BarePod | action=none | SKIP | ✅ LLM 主动给 none |
+
+**端到端验证完成的能力**:
+- ✅ 5 类 owner_kind (RS/DS/SS/Job/BarePod) 严格分发, 不再误判 (静态 Pod 的 Node 引用归 BarePod)
+- ✅ L2 审批走"IM 推送 + SQLite 持久化 + CLI approve" 完整闭环, 真实 StatefulSet 重启被人手 approve 后触发
+- ✅ L3 自动修复在生产集群上多次成功 (DaemonSet 删→重建)
+- ✅ Validator 老实标 pending, 不掩盖失败 (重启 30s 内未 ready 不报 success)
+- ✅ Triage 节点保留原始 labels (含 owner_kind/alertname), 修复了 Remediator 后处理拿不到 owner 的 bug
+- ✅ ApprovalGate target sanity check (target 必须出自原始告警, 抵御 LLM 幻觉编造 pod 名)
+- ✅ Executor T-1 实存性预检 (调用 K8s API `read_namespaced_pod` 二次确认, 404 直接 abort)
+
+**强制规则 R1/R2 这次没出场**: 因为 LLM 在 prompt 中正确遵循了 Owner 铁律. R1/R2 是兜底安全网, 不是日常代码路径——它没出场就是它在做对的事.
+
+#### 🎯 v2.1 半成品: Validator "重启无救"型故障升级
+
+实战中发现某些 Pod 重启后仍处于 `RunContainerError` (启动参数路径错 / 镜像配置错), 单纯重启无意义. 加了一条规则:
+
+- 在 `_capture_pod_state` 中收集所有容器的 `state.waiting.reason`
+- Validator + CLI approve 检查 `_NON_RESTARTABLE_REASONS` 集合: `RunContainerError` / `CreateContainerConfigError` / `CreateContainerError` / `InvalidImageName` / `ImageInspectError` / `ErrImagePull` / `ImagePullBackOff` / `ErrImageNeverPull`
+- 命中 → `status=escalate_human` (区别于 success/failed/pending), IM 用 🚨 图标推送, 提示"根因不在 runtime, 请人工检查配置/镜像/启动参数"
+- 用途: 告诉运维"我重启过了, 但这种状态再重启 1000 次也是同样的错, 请去看 ConfigMap / 镜像 / 启动命令"
+
+#### 🎯 v2.1 收尾: 关键路径单测 (5 个测试文件)
+
+为 v2.1 的强制规则 / 安全防线补 pytest 单测, 防止后续重构悄悄退化:
+
+| 文件 | 覆盖目标 | 用例数 |
+|-----|-----|-----|
+| `tests/test_remediator_post_process.py` | `_post_process_plan`: action= 前缀清洗 + target 校正 + R1 (BarePod/Job → none) + R2 (StatefulSet+CrashLoop → restart_statefulset_pod L2) | 14 |
+| `tests/test_validator_futility.py` | `_diagnose_restart_futility`: 8 类 "重启无救" reason 全覆盖 + 边界 (None/空 dict/未知 reason) | 17 |
+| `tests/test_approval_target_check.py` | `_validate_target_in_alerts`: target 与告警一致 / LLM 幻觉编 target / 格式错 / 空告警 / 兼容旧顶层 ns 字段 | 12 |
+| `tests/test_remediation_actions.py` | L2/L3 白名单注册表分离 + `is_action_allowed` 双查 + `restart_statefulset_pod` owner 校验 (用 monkeypatch 替 _v1) | 14 |
+| `tests/test_triage.py` | v2.1 关键修复: triage 必须保留原始 labels (含 owner_kind), 否则 R1/R2 全部失效 | 7 |
+
+服务器跑法: `cd aiops-multi-agent && pytest tests/test_remediator_post_process.py tests/test_validator_futility.py tests/test_approval_target_check.py tests/test_remediation_actions.py tests/test_triage.py -v`
+
+(以上 5 个测试文件全部是纯函数 + monkeypatch, 不连 K8s / vLLM / IM / Langfuse, 服务器无依赖也能跑.)
+
+### v2.2 完全托管 — 扩动作库 + R3 强制规则 (2026.06.25)
+
+实战发现 5 个 Agent 都升级到 Qwen2.5-32B-AWQ 后, 诊断质量大幅提升,
+但暴露出动作库太薄: 只有删/重启 Pod, 修不了 "改副本数 / 回滚 Deployment / 节点失联" 这类故障.
+
+#### R3: "重启无救" 强制规则 (Remediator 层防误修)
+
+实战 case (某 StatefulSet Pod):
+- RCA: `exec: stat /<app-path>/config.yaml: no such file or directory`
+- 旧版结果: R2 强制 → restart_statefulset_pod L2 (走人审, 但重启 1000 次也救不了)
+- 新版结果: R3 拦截 → action=none, escalate_human=True, IM 用 🚨 推
+
+R3 命中条件 (二选一):
+- RCA 文本里出现 `_R3_RCA_HINTS` 关键词 (no such file / flag not defined / executable not found / errimagepull / configmap / secret / ...)
+- alertname 在 `_R3_ALERT_TYPES` 集合 (RunContainerError / ImagePullBackOff / CreateContainerConfigError / ...)
+
+R3 执行后:
+- action 强制改 none (即使 R2 之前给了 restart_statefulset_pod)
+- safety_level=N/A, target 清空
+- 标 `escalate_human=True` (Notifier 用 🚨 而不是普通的 ⚠ / ✓)
+- `_overridden` 字段记录 R3 触发原因, 供调试用
+
+#### 新增 5 个动作 (覆盖率 30% → ~70%)
+
+L3 自动 (新增 2):
+- `cordon_node`: 标节点不可调度 (kubectl cordon). 适用节点频繁失联/磁盘满.
+  完全可逆, 不动存量 Pod. target 是 node 名 (无 namespace).
+- `uncordon_node`: 反操作.
+
+L2 人审 (新增 2):
+- `scale_deployment`: 调副本数. target=`namespace/deployment-name`.
+  必须额外指定 `replicas=N` (绝对值) 或 `delta=±N` (相对增减).
+  安全边界: |delta|<=5, 最终 replicas<=50.
+- `rollback_deployment`: 回滚到上一个 ReplicaSet (kubectl rollout undo).
+  实现方式: 列 deployment 关联的所有 RS, 按 revision 排序, 取倒数第二个的 template patch 回去.
+  限制: 至少要有 2 个 revision.
+
+#### Approval Gate target sanity check 升级
+
+旧版只认 `ns/pod` 格式. 新版按 action 类型分发:
+- `cordon_node` / `uncordon_node` → 校验 node 必须出自告警 `.labels.node`
+- `scale_deployment` / `rollback_deployment` → 仅校验 namespace 命中告警 (deployment 名信任 LLM)
+- 其他 (Pod 级) → ns + pod 严格双匹配 (与之前一致)
+
+#### Executor T-1 预检调整
+
+旧版对所有 action 都做 Pod 实存性预检, 新版按 `POD_LEVEL_ACTIONS` 集合判断:
+- 是 Pod 级 → 调 `read_namespaced_pod` 校验存在性
+- 是 node / deployment 级 → 跳过 T-1, 由各自 action 函数自检 (它们都会先 `read_node` / `read_namespaced_deployment`)
+
+scale_deployment 透传 plan.extra: Executor 和 CLI approve 都从 `plan.extra` 拿 `replicas` / `delta`,
+让 LLM 决定具体扩缩参数, 但安全边界由代码强制.
+
+#### 单测 (3 个新文件, 共 ~60 个用例)
+
+| 文件 | 覆盖目标 | 用例数 |
+|-----|-----|-----|
+| `tests/test_remediator_r3.py` | R3 强制规则: alertname 命中 / RCA 命中 / 与 R1/R2 优先级 / 边界 | 18 |
+| `tests/test_v22_actions.py` | cordon/uncordon/scale/rollback 全部走 monkeypatch (FakeNode/FakeDep/FakeRS) | 30 |
+| `tests/test_approval_target_v22.py` | target sanity check 三种 action 形态 + Pod 级回归 | 12 |
+
+服务器跑法 (v2.2 部分):
+```
+pytest tests/test_remediator_r3.py tests/test_v22_actions.py tests/test_approval_target_v22.py -v
+```
+
+### v2.3 完全托管闭环 — 失败再诊断 + 故障 Memory (2026.06.25)
+
+v2.0/v2.1/v2.2 之后管子已通, 但每次故障还是从零开始诊断. v2.3 解决两个真实痛点:
+
+1. **修复失败丢给人**: Validator 标 failed 之后只能等下一轮巡检 (5-10min 后),
+   人工不介入就是"故障未解决持续 N 分钟". 改成自动跳回 Investigator 重诊.
+2. **重复故障重复算**: 同一个 OOM 反复出现, 每次都让 LLM 跑 4-8 次推理.
+   实战经验里 80% 的故障是重复的. 加 Memory 层秒级响应.
+
+#### 修复失败自动再诊断闭环
+
+LangGraph 加一条条件边: `validator → investigator (failed + retry<MAX) | notifier (其他)`
+
+```
+… → Executor → Validator
+                  │
+        ┌─────────┴─────────┐
+        │ failed (retry<2)  │ success/pending/escalate/skipped
+        ▼                   ▼
+   Investigator         Notifier
+   (带上次 plan + 失败原因)
+```
+
+实现细节:
+- `AlertState` 加 `retry_count` / `last_failed_plan` / `last_failure_reason`
+- `Investigator` 入口检查 retry_count, 改 Prompt 加上"上次试过什么, 为什么失败, 避免同样方案"
+- `Investigator` 出口 retry_count++, Validator 路由按新值判断
+- 重试上限通过环境变量 `SELF_HEAL_MAX_RETRIES` (默认 2) 配置
+- `Validator` failed 时写 last_failed_plan/last_failure_reason 到 state, 给下次 Investigator 用
+
+#### 故障 Memory (SQLite 持久化)
+
+新模块 `tools/fault_memory.py`, 表 `fault_memory`:
+
+```sql
+fingerprint TEXT PRIMARY KEY,  -- md5(ns + alertname + rca前100字符)[:12]
+namespace, alertname, rca_text, plan_json, confidence (高/中/低),
+hits INT,                       -- 命中次数, 高频故障排行
+first_seen, last_used, last_success, ttl_sec  -- TTL 默认 1h
+```
+
+API:
+- `generate_fingerprint(ns, alert, rca)` → 12 位指纹 (大小写不敏感, 空格归一化, 只取前 100 字符)
+- `lookup(fp, only_high_confidence=True)` → 命中且未过期且置信度=高 才返回
+- `record_success(fp, ns, alert, rca, plan, confidence)` → Validator 成功时写
+- `record_hit(fp)` → 命中复用时 hits +1
+- `list_hot(limit=10)` → 高频故障排行
+- `forget(fp)` → 人工清理
+- `stats()` → 总条数 / 总命中 / 平均命中
+
+集成点:
+- **Investigator 入口** (retry_count==0): 用 `summary` 当 RCA 签名生成 fp, lookup 命中 →
+  直接把 cached.rca/plan 写进 state, 标 `from_memory=True`, **跳过 LLM 推理** (省 4-8 次调用)
+- **Remediator 入口**: 看到 from_memory=True 直接复用 plan, 跳过 LLM
+- **Validator success 时**: 提取 RCA 里的置信度, 写 `record_success(fp, ...)` (失败的 case 不入库)
+
+#### 实战价值 (预估)
+
+| 场景 | v2.2 | v2.3 |
+|-----|------|------|
+| 同 Pod 频繁 OOM | 每次 5-8 次 LLM 调用 (~30-60s) | 第二次起 0 次 LLM, 秒级 |
+| 修复失败 (Validator failed) | 等下一轮巡检 (5-10min) | 立即重诊 (最多 2 次, ~1min 内) |
+| 同类故障群 (5 个 Pod 同 OOM) | 5 次完整诊断 | 第一次诊断, 后 4 次 Memory 命中 |
+
+#### 单测 (2 个新文件, ~45 个用例)
+
+| 文件 | 覆盖 | 用例数 |
+|-----|-----|-----|
+| `tests/test_fault_memory.py` | generate_fingerprint / record_success / lookup / record_hit / TTL / 置信度过滤 / forget / stats / list_hot | 26 |
+| `tests/test_graph_routing.py` | _route_after_validator: failed → investigator / 达上限 → notifier / 各种状态 / 环境变量覆盖 | 18 |
+
+每个测试都用临时 SQLite 文件 (tmp_path fixture), 互不污染.
+
+服务器跑法 (v2.3 部分):
+```
+pytest tests/test_fault_memory.py tests/test_graph_routing.py -v
+```
+
+### v2.4 全量诊断 — 调度器排序修复 + 分级诊断 (2026.06.25)
+
+v2.3 跑通后实战暴露两个真实问题:
+
+**问题 1**: 7 个 ImagePullError Pod 全部排在 Top 3 之后, 没进流水线
+- 调度器 `_group_similar_issues` 按 (severity, restarts) 排, ImagePull 的 restart=0
+- 同 high 的某 namespace Unhealthy (restart=666) 排在前面把它挤掉了
+- 结果: 集群里 7 个真故障 (镜像拉不下来) 持续无人诊断
+
+**问题 2**: medium / low 级异常被 critical/high 硬过滤直接丢弃
+- `priority = [i for i in issues if sev in ("critical", "high")]`
+- 24 个 medium/low 异常 (有些是 "重启 5 次, 即将爆") 完全没进流水线
+- 这违背"无遗漏"设计原则
+
+#### 修复 1: 调度器排序加"卡死状态优先"
+
+`main_inspect.py:_group_similar_issues` 排序逻辑:
+
+```
+旧:  (severity, -restarts)
+新:  (severity, is_stuck ? 0 : 1, -restarts)
+```
+
+`is_stuck` 判定: type/reason 含 imagepull/errimage/configerror/runcontainererror 等 8 种关键词.
+
+效果: 同 severity 时, 卡死故障 (restart=0 但永不自愈) 优先于反复重启故障.
+
+#### 修复 2: 分级诊断, medium 也走流水线
+
+不再用 critical/high 硬过滤, 改成按 severity 分阶段:
+
+| Severity | 处理 | LLM 调用 |
+|---|---|---|
+| critical/high | 完整 ReAct (8 步) | 5-8 次 |
+| medium | 轻量诊断 (3 步快诊) | 2-3 次 |
+| low | 仅写审计, 不调 LLM | 0 次 |
+
+实现:
+- `AlertState` 加 `investigation_mode: "full" | "light"`
+- 调度器把 `investigation_mode=light` 写入 medium 组的 initial_state
+- `Investigator` 入口读 mode, light 模式 max_steps 改成 3
+- `low_issues` 全部写 `record_audit` 但不进流水线
+
+#### 修复 3: 默认 `--top` 从 20 → 50, 且支持 `--top 0` 不限制
+
+```
+旧: --top 默认 20 (实际跑 Top 3 时把卡死故障漏掉)
+新: --top 默认 50, 配合同类去重 + Memory 已能覆盖大集群
+    --top 0 表示不限制
+```
+
+#### 实战预期 (再跑一次同样的 54 异常集群)
+
+| 指标 | v2.3 | v2.4 |
+|------|------|------|
+| critical/high 进流水线 | 4 组 (Top 3 限制) | 全部 7 组 |
+| ImagePullError 被诊断 | ❌ 漏 | ✅ 排第一 |
+| medium 进流水线 | ❌ 全丢 | ✅ 轻量诊断 |
+| low 可见性 | ❌ 静默丢 | ✅ 审计文件 |
+| 总 LLM 调用 | 3-4 次 | ~10-15 次 (可接受, 32B 一次 RCA ~30s) |
+
+#### 单测 (1 个新文件, 13 个用例)
+
+| 文件 | 覆盖 | 用例数 |
+|-----|-----|-----|
+| `tests/test_scheduler_grouping.py` | 排序优先级 (critical>high) + 卡死状态优先 (ImagePullError 优先于 Unhealthy) + 同类去重 (ns+type 归组) + 边界 | 13 |
+
+服务器跑法 (v2.4 部分):
+```
+pytest tests/test_scheduler_grouping.py -v
+```
+
+### v2.5 准确性优先 — 分组按服务前缀 + 多容器日志 + 屏幕证据 (2026.06.25)
+
+实战暴露 3 个准确性问题:
+
+**问题 1**: 同类去重把不同服务合并 (运维误判)
+- 旧分组键: `(namespace, type)` → 同 ns 下所有 CrashLoopBackOff 归一组
+- 实际 case: 某 namespace 下 3 个完全不同的服务 (service-A / service-B / service-C)
+  都是 CrashLoopBackOff, 被合并到一组, 只诊断代表 service-A
+- 后果: service-B/C 被错误地套上 service-A 的诊断结论
+- **修复**: 加 `service_prefix` 维度, 按 owner_kind 提服务前缀:
+  - ReplicaSet: 去 pod 名最后 2 段 (`<deploy>-<rs-hash>-<pod-hash>`)
+  - DaemonSet/StatefulSet/Job/BarePod: 去最后 1 段
+  - 新分组键: `(namespace, type, service_prefix)`
+- **设计原则**: 运维准确性高于 LLM 成本.
+  分错故障 → 误诊 → 运维去修错的东西; 多调 N 次 LLM → 慢点而已. 选准确性.
+
+**问题 2**: 多容器 Pod 漏读 init container 日志
+- `get_pod_logs` 旧版只遍历 `p.spec.containers`, 跳过 `init_containers`
+- 后果: Pod 启动失败在 init 阶段 (e.g. config 初始化容器崩了), 故障信息看不到
+- **修复**: 同时遍历 `spec.containers + spec.init_containers`,
+  每个容器都打标签 (`=== init container: foo ===` / `=== container: bar ===`),
+  单容器日志限制提到 3000 字 (从 2000), 多容器累计才不会爆 LLM 上下文
+
+**问题 3**: 屏幕显示截断让运维误判
+- Investigator/Inspector 的 step 输出在屏幕上只显示前 200/120 字符
+- 多容器日志输出长, 屏幕上只看到第一个容器的开头, 误以为系统漏了
+- **修复**: 屏幕截断从 200 提到 1500 字, 超过时显式提示完整长度
+  ```
+  [Investigator]  step 0: 结果 (前 1500 字, 完整 4823 字):
+  <真实日志>
+  ... (截断剩余 3323 字)
+  ```
+- LLM 拿到的上下文从 1500 字提到 3000 字 (32B 上下文够用)
+
+#### 实战效果 (再跑同一个 54 异常集群)
+
+| 指标 | v2.4 | v2.5 |
+|------|------|------|
+| 单 ns 下不同服务的 CrashLoop 组数 | 1 (混在一组) | N (按服务分别成组) |
+| 不同服务的故障被独立诊断 | ❌ 套用代表 Pod 结论 | ✅ 各自拿自己的日志独立诊断 |
+| init container 故障可见 | ❌ 漏 | ✅ 单独标记日志 |
+| 屏幕证据可读性 | 200 字截断 | 1500 字 + 长度提示 |
+| 单轮 LLM 调用 | 7 次 | ~15 次 (可接受, 准确性优先) |
+
+#### 单测扩展
+
+`tests/test_scheduler_grouping.py` 加 6 个用例:
+- `test_same_ns_type_diff_prefix_NOT_grouped`: 实战 case 回归, 不同服务必须分别成组
+- `test_replicaset_prefix_drops_two_hash_segments`: RS Pod 名去 2 段
+- `test_daemonset_prefix_drops_one_segment`: DS Pod 名去 1 段
+- `test_statefulset_prefix_drops_ordinal`: STS Pod ordinal 当一段
+- `test_barepod_prefix_drops_one_segment`: 静态 Pod (node-ip 后缀)
+- 边界: 单段 pod 名 / 短名兜底
+
+### v2.6 忽略策略 — YAML 配置忽略 namespace / Pod (2026.06.25)
+
+实战需求: 集群里有些 namespace / Pod 是**已知噪音**, 不该进流水线浪费 LLM:
+- 监控团队独立维护的 ns
+- CI 临时 / 压测 Pod (启停频繁, 不是异常)
+- 已知 broken Pod, 等下次发版修
+
+#### YAML 配置驱动 (config/policies.yaml)
+
+```yaml
+ignores:
+  # 整 ns 忽略
+  - namespace: "monitoring"
+    reason: "监控团队独立维护"
+
+  # ns + 精确 pod 名
+  - namespace: "default"
+    pod: "my-debug-pod"
+    reason: "已知 debug Pod"
+
+  # ns + glob 通配 (* 任意, ? 单字符, [abc] 字符集)
+  - namespace: "ci"
+    pod_pattern: "test-*"
+    reason: "CI 临时 Pod"
+```
+
+#### 实现要点
+
+- **过滤时机**: `_run_cycle_body` 入口 (Inspector 之后, 调度器之前). 最早过滤,
+  下游所有逻辑 (去重 / 分级 / 诊断 / Memory) 都不会看到被忽略的 Pod
+- **每轮重新加载**: 改了 YAML 不需要重启服务, 下一轮巡检自动生效
+- **优雅降级**: 文件不存在 / 格式错 / PyYAML 未装 → 都不阻塞主流程,
+  打印警告并当作"无策略"处理
+- **可见性**: 命中策略的 Pod 在屏幕上显示"忽略 N 个 (规则: monitoring 整 ns: ...)"
+  按 reason 聚合, 不刷屏
+- **CLI**: `--policies path/to/your.yaml` 指定, 默认 `config/policies.yaml`,
+  可通过环境变量 `POLICIES_FILE` 覆盖
+
+#### 模板与单测
+
+- `config/policies.yaml.example` 带详细注释的模板 (复制成 `policies.yaml` 后改)
+- `tests/test_policy.py` 22 个用例:
+  - load: 文件缺失 / 空 / 注释 / 格式错 / 顶层非 dict / 正常
+  - match: 整 ns / ns+pod 精确 / ns+pod_pattern (含 ? 和 [abc])
+  - filter: 批量 / 顺序优先 / 边界
+
+服务器跑法:
+```
+pytest tests/test_policy.py -v
+```
+
+#### 实战预期
+
+| 场景 | 之前 | v2.6 |
+|---|---|---|
+| monitoring 团队独立 ns | 每轮都查, 浪费 LLM | YAML 加 `namespace: monitoring` 直接跳 |
+| 压测 Pod 启停反复 | 每次都进流水线 | `pod_pattern: load-*` 全跳过 |
+| 已知问题 Pod | 反复推 IM | `namespace: x, pod: y` 精确跳过 |
+| 改完策略 | 改代码 + 重启 | 改 YAML, 下一轮自动生效 |
+
+### v2.7 简化 — 删除冗余 LLM 阶段 + 策略前移 (2026.06.25)
+
+实战发现两个浪费 + 一个 bug:
+
+**浪费 1**: Inspector 阶段 2 "Top 5 LLM 深入预览"
+- 写死 Top 5, 调度器还要再完整诊断一遍 (信息冗余)
+- 32B 一次 ~30-60s, 每轮巡检多花的纯浪费
+
+**浪费 2**: Inspector 阶段 4 "LLM 整体摘要"
+- 用 LLM 写一句 "集群有 N 个问题..." 中文摘要
+- 调度器最后总结里有完整 reports, 这句摘要价值有限
+
+**Bug 3**: 策略过滤位置太晚, Top 10 显示被忽略的 Pod
+- 之前 v2.6 把过滤放在 `main_inspect._run_cycle_body`, 在 Inspector 已经
+  打印完 Top 10 之后
+- 视觉上看到 noaheepro 的 Pod 还在 Top 10 里 (虽然实际调度器拿到的是 23 个,
+  过滤了 9 个), 容易误判为"策略没生效"
+
+#### 改动
+
+- Inspector 现在纯代码逻辑, 0 次 LLM 调用:
+  - 阶段 1: 收集真实异常 (K8s API)
+  - 阶段 2: 应用策略过滤 (前移)
+  - 输出 Top 10 (代码生成, 无 LLM, 仅 namespace/pod/type/restarts/owner)
+- 删 `_react_deep_dive` (107 行) + `_llm_overview` (20 行)
+- 删 `DEEP_TOOLS` / `DEEP_TOOL_DESCS` / `_extract_json` 等只供阶段 2 用的死代码
+- `agents/inspector.py` 从 332 行 → 175 行 (-47%)
+- 策略过滤从 `main_inspect._run_cycle_body` 移到 `agents/inspector.run_inspector`,
+  保证 Top 10 显示已过滤后的列表
+
+#### 实战预期
+
+| 阶段 | v2.6 | v2.7 |
+|---|---|---|
+| Inspector LLM 调用 | 1-2 次 (阶段 2 + 阶段 4) | 0 次 |
+| 单轮 Inspector 耗时 | ~60-120s (含 LLM) | ~5-10s (纯 K8s API) |
+| Top 10 显示 | 含被忽略 Pod (视觉 bug) | 已过滤 |
+| 整体单轮巡检耗时 | ~3-6 min | ~2-5 min |
+
+#### config/policies.yaml.example pod_pattern 写法补充
+
+补了详细示例和"踩坑写法":
+
+```yaml
+# pod 名 "kube-external-auditor-192.168.48.78"
+#   - "kube-external-auditor-*"   ✓ 命中 (服务名开头, 匹配尾部 hash/IP)
+#   - "*kube-external-auditor*"   ✓ 命中 (包含即可)
+#   - "*-kube-external-auditor-*" ✗ 不命中 (要求前面必须有 -)
+```
+
+### v2.8 多集群部署 — LLM 工厂 + region 标识 (2026.06.25)
+
+接入多个集群/系统的部署需求, 加了两个东西:
+
+#### 1. tools/llm_factory.py — 统一 LLM 客户端工厂
+
+5 个 Agent 的 ChatOpenAI 实例化代码全部抽出, 改成 `build_llm(role, ...)`.
+模型/端口/key 通过环境变量切换, 不需要改代码.
+
+**两层环境变量**:
+
+```
+# 全局 (5 个 Agent 共享)
+LLM_MODEL=qwen2.5-32b
+LLM_BASE_URL=http://localhost:8001/v1
+LLM_API_KEY=dummy
+
+# 角色专属 (优先级高于全局)
+INVESTIGATOR_MODEL=deepseek-chat
+INVESTIGATOR_BASE_URL=https://api.deepseek.com/v1
+INVESTIGATOR_API_KEY=sk-xxx
+```
+
+**典型混合架构**:
+
+让 Investigator/Remediator (诊断 + 决策, 质量要求高) 走云 API 强模型,
+其他 Agent (Classifier/Aggregator, 简单任务) 保留本地 32B:
+
+```bash
+# 关键 Agent 用 DeepSeek
+export INVESTIGATOR_MODEL=deepseek-chat
+export INVESTIGATOR_BASE_URL=https://api.deepseek.com/v1
+export INVESTIGATOR_API_KEY=sk-xxx
+export REMEDIATOR_MODEL=deepseek-chat
+export REMEDIATOR_BASE_URL=https://api.deepseek.com/v1
+export REMEDIATOR_API_KEY=sk-xxx
+# 其余走本地 32B (默认就是)
+uv run python -u main_inspect.py
+```
+
+#### 2. REGION 标识符 — 多集群告警来源区分
+
+`tools/llm_factory.py:get_region()` 提供统一入口:
+
+```python
+# 优先级: REGION > AIOPS_REGION > "default"
+```
+
+集成点:
+- `tools/im_notify.py:format_alert_message` 第一行加 `[{region}]` 标签:
+  `🔴 [CRITICAL] [prod-bj] AIOps 告警`
+- `agents/notifier.py:notifier_node` 终端输出标题 + 增加一行 `region: prod-bj`
+
+**多集群部署示例**:
+
+```bash
+# 北京生产集群
+export REGION=prod-bj
+export KUBECONFIG=~/.kube/config-bj
+uv run python -u main_inspect.py
+
+# 上海生产集群 (另一个进程 / 另一个机器)
+export REGION=prod-sh
+export KUBECONFIG=~/.kube/config-sh
+uv run python -u main_inspect.py
+```
+
+两个集群的告警在同一个 IM 群里也能立刻分辨来源.
+
+#### 抽出的浪费 + 升级 max_tokens
+
+顺手做了:
+- Investigator / Remediator 的 `max_tokens` 从 512 → 1024 (避免 RCA / plan 被截)
+- 删除每个 Agent 文件里的 `_callbacks = [LANGFUSE_HANDLER] if ...` 重复样板,
+  统一到 build_llm 内部
+
+#### 单测
+
+- `tests/test_llm_factory.py` (新增, 15 个用例):
+  - `_resolve`: 默认 / 全局 env / 角色 env / 优先级 / 大小写
+  - `build_llm`: kwargs 透传 / max_tokens 可选 / 混合架构场景
+  - `get_region`: REGION / AIOPS_REGION fallback / 优先级 / 空字符串
+
+服务器跑法:
+```
+pytest tests/test_llm_factory.py -v
+```
+
+### v2.9 Function Calling Native — Investigator 改用 OpenAI 原生工具调用 (2026.06.26)
+
+**问题**: v2.0 起 Investigator 一直走 ReAct 字符串解析:
+- LLM 输出 JSON 文本 → 代码用 `_extract_json` 正则提取
+- 32B 输出基本稳定, 但偶尔被 markdown wrap (` ```json ... ``` `) / 多余 "好的我来分析:" 前缀
+  / 中间空字段搞翻车, 这种 case 触发的 R1/R2/R3 强制规则其实是给"坏格式"擦屁股
+- v2.0 起 vLLM 启动参数已经加了 `--enable-auto-tool-choice --tool-call-parser hermes`,
+  但代码层一直没用上, 长期浪费
+
+**改动**: 升级 Investigator 到 OpenAI Function Calling 协议
+- `tools/tool_schemas.py` (新增): 4 个工具的严格 JSON Schema (含 type / required / enum)
+- `agents/investigator.py`: 重构成 `_run_function_calling()` + `_run_react()` 双路径
+- 默认走 FC, 通过 `USE_FUNCTION_CALLING=false` 一键回退 ReAct
+- `langchain-openai` 的 `bind_tools(schema)` 自动透传给 vLLM, langchain 自动把
+  `tool_calls` 转 ToolMessage 回喂, 零字符串解析
+
+#### 模式对比
+
+| 维度 | ReAct (v2.0-v2.8) | Function Calling (v2.9) |
+|---|---|---|
+| LLM 输出 | 文本 + 内嵌 JSON | 结构化 tool_calls 数组 |
+| 解析 | 正则 + try/except | langchain 自动转 |
+| 失败模式 | JSON wrap / 多余前缀 / 字段空 | 几乎不会 |
+| 多工具并发 | 不支持 (一步一调) | 支持 (一轮 tool_calls 多个) |
+| 旧后端兼容 | 任何 OpenAI 兼容服务 | 要求 vLLM 0.6+ 且开 --enable-auto-tool-choice |
+
+LLM 收尾 (final) 时:
+- ReAct: 输出 `{"action":"final","hypothesis":"...","confidence":"...","key_evidence":[...]}`
+- FC: 不调工具, 直接自然语言三行 (根因 / 置信度 / 关键证据), `_parse_fc_final` 抽取
+
+#### 兼容性 / 切换
+
+```bash
+# 默认开启 (推荐, 32B 体验显著更好)
+uv run python -u main_inspect.py
+
+# 一键回退 ReAct (vLLM 不支持 tool_calls / 调试时用)
+export USE_FUNCTION_CALLING=false
+uv run python -u main_inspect.py
+```
+
+旧 ReAct 路径完整保留, 没删. Memory 命中 / 闭环重诊 / 分级诊断 / 代码兜底 都跟旧版一致.
+
+#### 单测
+
+- `tests/test_function_calling.py` (新增, 12 个用例): 覆盖 `_parse_fc_final`
+  - 标准三行格式 (中英文冒号)
+  - 多条证据分隔符 (`,` / `；` / `\n`)
+  - 缺字段兜底 (无证据 / 无置信度)
+  - 自由文本兜底 (LLM 没按格式输出整段当 hypothesis)
+  - 边界 (空字符串 / None / 超长截断 / 不吸下一字段)
+
+服务器跑法:
+```
+pytest tests/test_function_calling.py -v
+```
+
+#### 实战预期
+
+| 现象 | v2.8 | v2.9 |
+|---|---|---|
+| Investigator 给非 JSON 输出 | 偶尔, 触发 `JSON 解析失败` | 几乎绝迹 |
+| R1/R2/R3 强制规则触发率 | ~5-10% | 预期 ↓ (LLM 输出更稳, 格式不再翻车) |
+| 多工具并行 | 一步一个 | 复杂诊断可一轮调 2 个 |
+
+### v2.10 方法论提示词 + 防循环 / 防呆三道闸 (2026.06.26)
+
+v2.9 切到 Function Calling 后实战暴露 3 类问题, 全部在工程层(非模型层)解决:
+
+**问题 1**: prompt 写"碰到 X 用 Y"的关键词匹配, 换故障类型立刻翻车
+- 旧版 prompt 列举"ImagePullBackOff → restart_pod_for_image_pull / OOM → check resource"等映射
+- 实战 case: 集群里多了"GPU 驱动 NVML 加载失败"和"OCI invalid mount"两类没列举的故障 → LLM 给 restart_pod 误判
+- 用户反馈: **"现在是遇到一个修复一个 case 打补丁一样, 为什么不能让他知道遇到问题后分析问题"**
+
+**问题 2**: LLM 编造 Pod 名死循环
+- 实战 case: device-plugin-patch 诊断时 LLM 想做"横向验证"
+  但没数据来源, 自己编了 3 个不存在的 Pod 名 (`gpu-pod-12345` / `nvidia-device-plugin-abc` 等)
+  反复调 `kubectl_describe` → 全 404 → 继续编 → 直到 max_steps 才停
+- 一个故障烧掉 4-6 次 LLM 调用, 完全浪费
+
+**问题 3**: `get_pod_logs` 参数 schema 不匹配
+- LLM 受 prompt 引导主动传 `previous=true`, 但 wrapper 不接受 → 每次都 TypeError
+- 实测一次巡检触发 12 次 TypeError
+
+#### 修复 1: prompt 重写成方法论 (不是关键词表)
+
+`_SYSTEM_TPL` 完全重写, 引入 4 层根因模型 + Hypothesis-Verify-Refine 方法:
+
+```
+一. 根因层级模型 — 所有 K8s 故障都落在这 4 层之一
+1) 容器进程层: 进程崩了/退出码非0/panic/业务逻辑错 → 业务方/镜像作者修
+2) Pod 配置层: 启动命令错/env错/挂载错/资源 limit 不够 → YAML 维护者修
+3) Host/Node 层: 节点磁盘满/driver没装/containerd配置坏 → 节点运维修
+4) 集群/控制面层: apiserver慢/etcd抖/DNS挂/CNI异常 → 平台运维修
+
+二. 调查方法 (Hypothesis → Verify → Refine)
+每步: 假设根因在哪层 → 调最能验证假设的工具 → 看结果支持/推翻 → final 或修正假设
+质量优先, 步数其次. 拿到精确错误原文 (Back-off pulling / invalid mount /
+flag not defined) 立即 final, 不要凑步数.
+
+三. 判断层级的关键启发式:
+"这个错重启 Pod 能修吗?"
+- 能修 → 多半 1 层
+- 重启 100 次还崩 → 升级 2/3 层
+- restart_count 几千次 → 几乎必然 2/3/4 层, 不是 1 层
+```
+
+实战效果: 集群里出现的"GPU NVML 加载失败"prompt 没列举, 但 LLM 自主判 Host 层 + 写 RCA:
+`"Host 层 nvidia driver / NVML 库未正确加载, restart=2588 (重启 N 次仍崩, 排除容器进程层)"`
+
+#### 修复 2: 防循环 / 防呆三道闸
+
+`agents/investigator.py:_run_function_calling()` 加 3 道闸:
+
+**闸 1 - 参数纠错注入**: 工具返回字符串里出现 `TypeError ... unexpected keyword argument`
+- 自动追加 schema 提示: `"[提示] 请只使用 schema 声明的参数 (name/namespace/lines/previous)"`
+- LLM 下一步会自动修正参数 (实测 100% 生效)
+
+**闸 2 - nudge**: 同一 `(tool, sorted_args)` 第 2 次出现
+- 追加 HumanMessage: `"[提示] 你刚才重复调用了同一个工具+参数, 换工具或换参数或基于已收集证据 final"`
+- 让 LLM 自己跳出来, 不强行中断
+
+**闸 3 - 强制中断**: 同一 `(tool, sorted_args)` 第 3 次
+- `_log("⚠ 同一调用已第 3 次, 判定 LLM 卡死, 中断进代码兜底")`
+- 返回 None → 代码兜底拼装保守结论
+- 实测一次诊断从 6-8 次 LLM 调用降到最多 4 次
+
+#### 修复 3: `get_pod_logs` 接受 `previous` 参数
+
+`tools/mock_tools.py` wrapper 改成 `(name, namespace, lines=30, previous=True)`,
+`tools/tool_schemas.py` 同步声明 `previous` 字段. LLM 显式传不再 TypeError.
+
+#### 修复 4: R3 黑名单扩展 10 个关键词
+
+`agents/remediator.py:_R3_RCA_HINTS` 加:
+- 挂载层: `invalid mount` / `bind mounts cannot have` / `failed to create containerd task` / `oci runtime create failed`
+- GPU 驱动: `nvml` / `could not load` / `dcgm initialization` / `cuda error` / `no such device` / `failed to initialize`
+
+实战命中: dcgm-exporter (restart=2589) / device-plugin-patch (restart=2588) 这类
+"重启 1000 次都救不了" 的 Host 层故障, R3 强制 `action=none` + `escalate_human=True`,
+不让 LLM 出 restart_pod 馊主意.
+
+#### 修复 5: `_parse_fc_final` 多行匹配 + "无" 过滤
+
+旧版正则 `关键证据[:：]\s*(.+?)` 只能匹配单行, LLM 给多行证据时全部丢失 → 输出 "关键证据: 无".
+
+新版 `[\s\S]+?` 非贪婪跨行匹配 + 排除 `"无"` / `"(无)"` 开头的伪证据:
+
+```python
+key_evidence_raw = _grab(r"关键证据[:：]\s*([\s\S]+?)(?=\n(?:根因|置信度)[:：]|$)")
+key_evidence = [s.strip() for s in re.split(r"[;；\n]", key_evidence_raw)
+                if s.strip() and not s.strip().startswith(("无", "(无)"))]
+```
+
+#### 实战效果对比 (同一个 5-case 集群)
+
+| 指标 | v2.9 | v2.10 |
+|---|---|---|
+| 平均诊断步数 | 4-6 | 1-3 |
+| 编造 Pod 名循环 | 偶发 4-6 步 | 第 3 次强制中断 (上限 3 步) |
+| TypeError 触发 | 一轮 12 次 | 0 次 |
+| Host 层 / Pod 配置层正确分类 | 80% | 100% (5/5) |
+| `action=restart_pod` 误判率 (重启无救型) | 10% | 0% (R3 黑名单扩展后) |
+
+#### 模型可替换性验证
+
+同 prompt + 同代码下分别用 Qwen2.5-32B (本地) 和 DeepSeek-V3 (API) 跑同一个 5-case 集群:
+- 诊断结论: **5/5 case 层级判断完全一致**
+- 关键证据: 完全一致 (都引用工具输出原文)
+- 步数差异: < 1 步
+
+结论: **代码层做对后, 模型选择影响有限**. 业界"AIOps 必须用 GPT-4 / Claude"的论调
+在结构化场景下被反证. 生产可用 Qwen-32B, 调试可对照 DeepSeek 当回归基线.
+
+### v2.11 草稿检测器 — 拦截"思考过程当 final 输出" (2026.06.26)
+
+v2.10 解决了"LLM 编造 Pod 名循环", 但又发现新问题:
+
+**问题**: Function Calling 模式下, Qwen / DeepSeek 偶尔会**返回空 tool_calls 但内容是草稿**
+- Case A (dcgm-exporter): step 0 直接返回 `"首先, 根据告警信息, Pod 在 ... 出现了 CrashLoopBackOff... ### 假设 1. 容器进程层 ..."`
+  没调任何工具, 还是思考过程, 但 tool_calls 是空的 → 旧逻辑当真 final 处理 → 下游 Remediator 拿"假设1..."当 RCA, 给出 restart_pod L3 (差点假修复一个已重启 2585 次的 Pod)
+- Case B (device-plugin-patch): step 0 返回 `"第一步应该调用 kubectl_describe... \`\`\`json {name: 'kubectl_describe', arguments: {...}} \`\`\`"`
+  在 markdown 里描述工具调用, 但 tool_calls 字段空 → 被当 final → 下游 Remediator 给 restart_pod
+
+**根因**: 32B / 671B-MoE 模型在 Function Calling 协议下都不是 100% 严格遵循,
+**"想调工具" 和 "真发起 tool_calls"** 是两件事. 协议层必须有兜底.
+
+#### 修复: `_looks_like_draft()` 二次校验 + 强制重试
+
+`agents/investigator.py`:
+
+```python
+def _looks_like_draft(content: str) -> bool:
+    """判定"空 tool_calls 回答"是不是草稿"""
+    text = content.strip()
+    # 合法 final 必有"根因:"标签
+    if re.search(r"根因\s*[:：]", text): return False
+    # 缺标签 + 出现草稿关键词 → 草稿
+    draft_signals = ("假设", "第一步", "应该调用", "我们需要", "我打算",
+                     "我将", "我会", "下一步", "```json", "```\n")
+    if any(sig in text for sig in draft_signals): return True
+    # 太短也算草稿
+    if len(text) < 60: return True
+    return False
+
+# _run_function_calling 主循环里
+if not tool_calls:
+    is_draft = _looks_like_draft(resp.content)
+    has_no_evidence = step == 0 and not evidence  # 还没调工具就 final → 100% 幻觉
+    if is_draft or has_no_evidence:
+        empty_call_retry += 1
+        if empty_call_retry >= 2:
+            return None  # 重试 1 次仍失败 → 代码兜底
+        # 注入"必须二选一"纠错提示
+        msgs.append(HumanMessage(
+            "[严重错误] 你没调用工具也没给合法 final, 必须二选一:\n"
+            "(A) 通过 function_call 接口发起 tool_calls, 不要用文字描述\n"
+            "(B) 严格按三行格式 final: 根因:/置信度:/关键证据:"
+        ))
+        continue
+    return _parse_fc_final(resp.content)  # 真 final
+```
+
+#### system prompt 第五节重写
+
+明确写**"用文字描述工具调用 = 无效输出, 会被判定草稿要求重做"**, 附 4 个反例:
+
+```
+错误示例 (会被判定草稿, 强制重做):
+- "首先, 根据告警信息, Pod 在 ... 出现了 CrashLoopBackOff..." (思考过程, 不是 final)
+- "第一步应该调用 kubectl_describe 来查看..." (描述, 不是真调用)
+- "### 假设\n1. 容器进程层..." (思考, 不是结论)
+- "```json\n{"name": "kubectl_describe", ...}\n```" (只是文本, 不会被当工具调用)
+
+重要: step 0 还没有任何工具证据时, 严禁直接给 final
+```
+
+#### 实战效果 (同一 5-case 集群)
+
+| 指标 | v2.10 | v2.11 |
+|---|---|---|
+| 草稿当 final 通过率 | 2/5 (dcgm + device-plugin-patch) | 0/5 |
+| Remediator 拿到草稿 RCA 出 restart_pod | 2 次 | 0 次 |
+| 草稿检测触发率 | - | 偶发 (实测 device-plugin-patch step 0 触发 1 次, retry 后正确给 NVML 诊断) |
+
+实测日志:
+```
+[Investigator] step 0: ⚠ LLM 空 tool_calls 但内容是草稿 (retry=1), 强制重新输出
+[Investigator]  step 1: 调用 get_pod_logs(...)
+[Investigator] step 2: LLM 收尾 (Function Calling final)
+[Investigator] 结论: Host 层 nvidia driver / NVML 库... 关键证据: panic: could not load NVML library; restart_count=2584
+```
+
+#### 跨模型验证
+
+| 模型 | 草稿出现率 | 草稿检测触发率 | 最终诊断正确率 |
+|---|---|---|---|
+| Qwen2.5-32B-AWQ (本地) | ~20% | 100% 命中 | 5/5 |
+| DeepSeek-V3 API | ~10% | 100% 命中 | 5/5 |
+
+**结论**: 协议层防呆比换更强的模型更重要. v2.11 之后, **本地 Qwen-32B 在 5-case 真实集群上诊断质量与 DeepSeek-V3 几乎一致**.
+
 ---
 
 # 🔥 Tier S — 必做项 (v1.1 已部分完成)
@@ -102,7 +880,7 @@
 关系: depends_on / runs_on / pulls_from / triggers / similar_to / fixed_by
 
 查询时不再向量检索, 而是:
-1. 抽取查询中的实体 (e.g. "harbor-registry")
+1. 抽取查询中的实体 (e.g. "image-registry")
 2. 沿关系图遍历 (downstream / similar_faults)
 3. 用 community detection 做全局摘要
 ```
@@ -289,15 +1067,15 @@ def prometheus_query(query): ...
 ## A4. Topology-Aware 故障传播分析 ⭐ (强烈推荐)
 
 **问题**: 当前诊断只看单个 Pod, 但生产故障常常是连锁反应。
-例如 harbor 挂了 → 所有依赖 harbor 拉镜像的 Pod 都受影响。
+例如 镜像仓库挂了 → 所有依赖 镜像仓库拉镜像的 Pod 都受影响。
 
 **做法**:
 ```python
 # 拉 K8s 拓扑 (NetworkPolicy / Service / Ingress / 应用调用关系)
 graph = build_dependency_graph()
 
-# 当 harbor-registry 挂了
-downstream = graph.descendants("harbor-registry")  # 所有下游
+# 当 image-registry 挂了
+downstream = graph.descendants("image-registry")  # 所有下游
 affected_pods = pods_with_image_pull_in_progress()  # 实时受影响
 
 # 给出影响面分析
@@ -497,15 +1275,23 @@ T3: 验证窗口 (2min / 10min, 重启率/错误日志/业务指标)
 - [x] **Validator** (30s 同步健康检查)
 
 ## 第 1-2 周 (v1.2 重点)
-- [ ] **S5 Function Calling Native** (0.5d) — 最简单收益最快, 替代 ReAct 字符串解析
-- [ ] **S4 历史故障 Memory** (1d) — 立刻能讲 MTTR 故事
-- [ ] **S3 Critic Agent** (1d) — 反 LLM 幻觉, 关键质量保障
+- [x] ~~S5 Function Calling Native~~ ✅ v2.9 已完成
+- [x] ~~S4 历史故障 Memory~~ ✅ v2.3 已完成
+- [ ] **S3 Critic Agent** (1d) — 注: v2.10/v2.11 的草稿检测 + 防循环 + R3 强制规则
+  已覆盖大部分 LLM 幻觉拦截场景, Critic 优先级可往后挪 (实战 5/5 case 全对, 没出现需要 Critic 的场景)
 
 ## 第 3-4 周 (v1.2 收尾)
-- [ ] **A1 Eval Set + LLM-as-Judge** (1d) — 回归测试基础设施
+- [ ] **A1 Eval Set + LLM-as-Judge** (1d) — 把 v2.11 跑通的 5 个真实 case
+  固化成 `tests/test_real_cases.py`, prompt 改动跑回归 (是后续所有迭代的前置条件)
 - [ ] **A3 Tool Result Caching** (0.5d) — 单次巡检 PromQL ↓70%
 
 ## 第 5-7 周 (v1.3)
+- [ ] **SOP 知识库注入** (1.5d, 新增) — 把沉淀的 SOP 文档接进 Investigator prompt
+  - frontmatter (alertname / keywords / pod_pattern) 标触发条件
+  - 匹配命中后整篇 SOP 注入 user message
+  - LLM 按 SOP "诊断步骤" 走, 比方法论更精准 (方法论是 fallback)
+- [ ] **修复建议生成 Agent** (1d, 新增) — action=none 的"重启无救"故障也给可粘贴的
+  具体命令 / runbook / git PR diff 草案 (让 IM 通知从"需人工"变成"需人工, 建议执行 xxx")
 - [ ] **A4 Topology-Aware** (2d) — AIOps 圣杯方向
 - [ ] **A5 TimesFM 时序预测** (1d)
 - [ ] **A2 HyDE + Rerank** (1d)
@@ -532,11 +1318,28 @@ T3: 验证窗口 (2min / 10min, 重启率/错误日志/业务指标)
   v1.1: 同类去重 (LLM 调用 ↓60%) + Langfuse 全链路 trace 监控
   v2.0: 9 节点完整自愈流水线 (Remediator + ApprovalGate + Executor + Validator)
         + L1-L4 安全分级 + 4 层安全保险 + 三重校验
-- v1.2: Function Calling Native + 历史故障 Memory (LangMem 思路, 实测 MTTR ↓60%)
-  + Critic Agent (CRITIC 论文范式, 反 LLM 幻觉) + Eval Set
+- v2.1-v2.8 已完成 (2026.06):
+  v2.1: R1/R2 强制规则 + target sanity check + Validator 重启无救升级 + 关键路径单测
+  v2.2: R3 强制规则 + 扩动作库 (cordon/scale/rollback) + 60 用例新单测
+  v2.3: 失败再诊断闭环 + 故障 Memory (SQLite, 同指纹复用)
+  v2.4: 分级诊断 (critical/high/medium/low) + 卡死状态排序
+  v2.5: 服务前缀三维分组 + 多容器日志 + 屏幕证据扩展
+  v2.6: YAML 忽略策略
+  v2.7: 删除冗余 LLM 阶段 (Inspector 0 次 LLM 纯代码)
+  v2.8: LLM 工厂 (全局 + 角色级 env) + REGION 多集群标识
+- v2.9-v2.11 已完成 (2026.06.26):
+  v2.9: Function Calling Native (Investigator 升级 OpenAI 原生 tool_calls,
+        + 自然语言三行 final 解析, vLLM bind_tools 自动透传)
+  v2.10: prompt 方法论化 (4 层根因 + Hypothesis-Verify-Refine)
+         + 防循环三道闸 (参数纠错/nudge/强制中断)
+         + R3 黑名单扩展 10 关键词 (GPU 驱动 / OCI 挂载)
+  v2.11: 草稿检测器 (拦"思考过程当 final"), 跨模型验证 Qwen / DeepSeek 诊断质量一致
+- v1.2: SOP 知识库注入 (用户沉淀文档 → prompt) + 修复建议生成 Agent
+        + Eval Set + LLM-as-Judge (回归测试) + Tool Result Caching
 - v1.3: Topology-Aware 故障传播分析 + TimesFM 时序异常预测
-- v2.1: 飞书 webhook 人审回调 + Validator 异步三次检查
+- v2.x: 飞书 webhook 人审回调 + Validator 异步三次检查
   + 微软 GraphRAG 知识库 (基于服务依赖图谱回答全局根因)
+  + Critic Agent (优先级降低, 现有代码层防呆已覆盖大部分场景)
 - v3.0: Tool-use SFT 微调 Qwen + Multi-Agent Debate + MCP Protocol
 ```
 

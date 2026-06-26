@@ -109,13 +109,20 @@ from tools.k8s_tools import get_pod_logs as _real_get_pod_logs
 
 
 
-def get_pod_logs(name: str, namespace: str, lines: int = 30) -> str:
+def get_pod_logs(name: str, namespace: str, lines: int = 30,
+                 previous: bool = True) -> str:
 
 
-    """获取 Pod 日志 (含上次崩溃前的日志)"""
+    """获取 Pod 日志 (含上次崩溃前的日志).
+
+    previous 参数兼容 LLM 显式传入 (v2.10):
+    - 默认 True 时同时拉当前 + 上次崩溃日志 (k8s_tools 原行为)
+    - 显式 False 时仅拉当前日志
+    LLM 受 prompt 引导有时会主动传 previous=true, 之前的版本没声明这参数会 TypeError.
+    """
 
 
-    return _real_get_pod_logs(name=name, namespace=namespace, lines=lines, previous=True)
+    return _real_get_pod_logs(name=name, namespace=namespace, lines=lines, previous=previous)
 
 
 

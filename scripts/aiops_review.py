@@ -25,7 +25,7 @@ from tools.approval_store import (
     is_expired, DEFAULT_TTL_SEC,
 )
 from tools.remediation_actions import (
-    is_l3_allowed, execute_action, _split_target, _capture_pod_state,
+    is_action_allowed, execute_action, _split_target, _capture_pod_state,
 )
 from tools.safety_guards import allow as rate_allow, record_audit
 from tools.im_notify import send_message
@@ -145,10 +145,10 @@ def cmd_approve(args):
     action = plan.get("action", "")
     target = plan.get("target", "")
 
-    # 双重保险: 即使 plan 标的是 L2, 也要求 action 在 L3 白名单才能执行
-    if not is_l3_allowed(action):
-        _log(f"❌ 拒绝执行: action '{action}' 不在 L3 白名单, 不能通过 CLI 执行")
-        _log(f"   (L2 操作如 cordon_node 当前未在执行端实现, 需手动 kubectl)")
+    # 双重保险: 必须在 L3 自动白名单 或 L2 人审灰名单 中
+    if not is_action_allowed(action):
+        _log(f"❌ 拒绝执行: action '{action}' 不在 L3/L2 白名单, 不能通过 CLI 执行")
+        _log(f"   (检查: tools/remediation_actions.py 中 ALLOWED_ACTIONS 和 ALLOWED_L2_ACTIONS)")
         sys.exit(1)
 
     by = args.by or os.getenv("USER") or getpass.getuser() or "unknown"
@@ -191,10 +191,15 @@ def cmd_approve(args):
     if snap_before and not snap_before.get("error"):
         _log(f"  T0: phase={snap_before.get('phase')} restarts={snap_before.get('total_restarts')}")
 
-    # 执行
+    # 执行 (scale_deployment 透传 plan.extra 里的 replicas / delta)
     dry_run = _is_dry_run()
     _log(f"  执行: {action}({target})  dry_run={dry_run}")
-    result = execute_action(action, target, dry_run=dry_run)
+    extra = (plan.get("extra") or {}) if isinstance(plan.get("extra"), dict) else {}
+    if action == "scale_deployment":
+        kw = {k: v for k, v in extra.items() if k in ("replicas", "delta")}
+        result = execute_action(action, target, dry_run=dry_run, **kw)
+    else:
+        result = execute_action(action, target, dry_run=dry_run)
     _log(f"  结果: {result}")
 
     # 审计
@@ -260,7 +265,20 @@ def cmd_approve(args):
             ready = not snap_now.get("any_not_ready", True)
             before_restarts = (snap_before or {}).get("total_restarts", 0)
             now_restarts = snap_now.get("total_restarts", 0)
-            if phase == "Running" and ready and now_restarts <= before_restarts + 1:
+
+            # "重启无救" 型故障升级人审 (RunContainerError / ImagePullBackOff / ConfigError ...)
+            from agents.validator import _diagnose_restart_futility
+            is_futile, futile_reasons = _diagnose_restart_futility(snap_now)
+            if is_futile:
+                validation = {
+                    "status": "escalate_human",
+                    "reason": (
+                        f"重启无救型故障 (waiting.reason={','.join(futile_reasons)}); "
+                        f"根因不在 runtime, 重启不解决问题, 请人工检查配置/镜像/启动参数"
+                    ),
+                    "futile_reasons": futile_reasons,
+                }
+            elif phase == "Running" and ready and now_restarts <= before_restarts + 1:
                 validation = {"status": "success", "reason": f"ready, restart_delta={now_restarts - before_restarts}"}
             elif now_restarts > before_restarts + 5:
                 validation = {"status": "failed", "reason": f"restarts +{now_restarts - before_restarts}"}
@@ -272,8 +290,10 @@ def cmd_approve(args):
     mark_executed(args.approval_id, final_result)
 
     # 推 IM 第二条 (执行 + 验证结果)
-    icon = {"success": "✅", "pending": "⏳", "failed": "❗", "skipped": "-"}.get(
-        validation.get("status"), "?")
+    icon = {
+        "success": "✅", "pending": "⏳", "failed": "❗", "skipped": "-",
+        "escalate_human": "🚨",
+    }.get(validation.get("status"), "?")
     send_message(
         f"{icon} [EXECUTED] approval_id={args.approval_id}\n"
         f"  by: {by}    action: {action}    target: {target}\n"

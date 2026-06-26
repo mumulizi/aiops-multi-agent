@@ -1,18 +1,9 @@
 """Aggregator Agent: 把多条告警聚合成一句话事件描述"""
 import json
-from langchain_openai import ChatOpenAI
 from agents.state import AlertState
-from tools.langfuse_setup import LANGFUSE_HANDLER
+from tools.llm_factory import build_llm
 
-_callbacks = [LANGFUSE_HANDLER] if LANGFUSE_HANDLER else []
-
-_llm = ChatOpenAI(
-    model="qwen2.5-7b",
-    base_url="http://localhost:8001/v1",
-    api_key="dummy",
-    temperature=0,
-    callbacks=_callbacks,
-)
+_llm = build_llm("aggregator", temperature=0)
 
 
 def aggregator_node(state: AlertState) -> AlertState:

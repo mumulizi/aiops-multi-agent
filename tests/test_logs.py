@@ -2,11 +2,11 @@ from tools.k8s_tools import get_pod_logs
 
 # 测试一个真实 CrashLoopBackOff 的 Pod
 print("=" * 60)
-print("Test: harbor-registry 日志")
+print("Test: xxxx-xxxxx 日志")
 print("=" * 60)
 result = get_pod_logs(
-    name="ccr-harbor-registry-68b7bcb984-tkxlz",
-    namespace="ccr-system",
+    name="xxxxxxx-68b7bcb984-tkxlz",
+    namespace="xxxx-xxxx",
     lines=30,
 )
 print(result)

@@ -26,6 +26,31 @@ def _wait_seconds() -> int:
         return 30
 
 
+# "重启无救" 型异常 reason 集合.
+# 这类故障的根因是配置/镜像/挂载/启动参数, 重启 1000 次也是同样的错.
+# Validator 看到这种 reason → 直接告警 "重启不解决问题, 根因不在 runtime, 请人工介入".
+_NON_RESTARTABLE_REASONS = {
+    "RunContainerError",        # 启动命令/参数错 (container 进程无法 exec)
+    "CreateContainerConfigError",  # ConfigMap/Secret 引用错
+    "CreateContainerError",     # 容器配置错 (volume mount/security context)
+    "InvalidImageName",         # 镜像名拼错
+    "ImageInspectError",        # 镜像本身坏
+    "ErrImagePull",             # 拉镜像失败 (auth/network/repo)
+    "ImagePullBackOff",         # 拉镜像反复退避
+    "ErrImageNeverPull",        # imagePullPolicy=Never 但本地无镜像
+}
+
+
+def _diagnose_restart_futility(snap_now: dict) -> tuple:
+    """判断"重启无救"型故障. 返回 (is_futile: bool, reasons: list).
+
+    用 _capture_pod_state 已经收集好的 waiting_reasons.
+    """
+    waiting_reasons = (snap_now or {}).get("waiting_reasons", []) or []
+    matched = [r for r in waiting_reasons if r in _NON_RESTARTABLE_REASONS]
+    return (len(matched) > 0, matched)
+
+
 def _check_pod_recreated_by_owner(namespace: str, old_pod_name: str) -> dict:
     """检查 namespace 下是否有新 Pod 被控制器重建出来 (替代旧 Pod 名).
 
@@ -118,6 +143,28 @@ def validator_node(state: AlertState) -> AlertState:
     snap_now = _capture_pod_state(ns, name)
     state["snapshot_after"] = snap_now
 
+    # 优先检查"重启无救"型故障: 重启完仍是 RunContainerError/ImagePullBackOff/...
+    # 这种状态再多重启 N 次也是同样的错, 必须升级人审而不是循环重试.
+    is_futile, futile_reasons = _diagnose_restart_futility(snap_now)
+    if is_futile:
+        result = {
+            "status": "escalate_human",  # 区别于 success/failed/pending
+            "verified_at": f"{_wait_seconds()}s",
+            "reason": (
+                f"重启无救型故障 (waiting.reason={','.join(futile_reasons)}); "
+                f"根因不在 runtime, 重启不解决问题, 请人工检查配置/镜像/启动参数"
+            ),
+            "futile_reasons": futile_reasons,
+        }
+        state["validation_result"] = result
+        _log(f"[Validator] ⚠ {result['status']}: {result['reason']}")
+        record_audit({
+            "stage": "validator", "trace_id": state.get("trace_id"),
+            "target": target, "result": result["status"],
+            "reason": result["reason"],
+        })
+        return state
+
     if snap_now.get("error"):
         # Pod 不存在了: 区分情况
         action = plan.get("action", "")
@@ -199,9 +246,42 @@ def validator_node(state: AlertState) -> AlertState:
     state["validation_result"] = result
     _log(f"[Validator] {result['status']}: {result.get('reason', '')}")
 
+    # v2.3 故障 Memory: success 时记录修复成功的 (指纹, plan), 给后续同类故障复用
+    if result["status"] == "success":
+        fp = state.get("fingerprint")
+        if fp and not state.get("from_memory"):
+            # 不复写 from_memory=True 的记录 (它本来就是 Memory 来源)
+            try:
+                from tools.fault_memory import record_success
+                rca = state.get("rca_hypothesis", "")
+                # 从 rca 文本里提置信度 (Investigator 输出格式: "...(置信度: 高; ...)")
+                confidence = "中"
+                if "置信度: 高" in rca or "置信度:高" in rca:
+                    confidence = "高"
+                elif "置信度: 低" in rca or "置信度:低" in rca:
+                    confidence = "低"
+                first_alert = (state.get("raw_alerts") or [{}])[0]
+                labels = first_alert.get("labels") or {}
+                ns = labels.get("namespace", "") or first_alert.get("namespace", "")
+                alertname = labels.get("alertname", "") or \
+                            first_alert.get("alertname", "")
+                record_success(fp, ns, alertname, rca, plan, confidence=confidence)
+                _log(f"[Validator] 📌 写入 Memory fp={fp} confidence={confidence}")
+            except Exception as e:
+                _log(f"[Validator] ⚠ Memory 写入失败 (不影响主流程): {e}")
+
+    # v2.3: failed 时记录失败上下文, 给闭环重诊用
+    if result["status"] == "failed":
+        state["last_failed_plan"] = dict(plan)  # 拷贝, 避免后续被改
+        state["last_failure_reason"] = result.get("reason", "")
+        retry_count = state.get("retry_count", 0)
+        _log(f"[Validator] ⟳ 失败上下文已记录, 当前 retry_count={retry_count}")
+
     record_audit({
         "stage": "validator", "trace_id": state.get("trace_id"),
         "target": target, "result": result["status"],
         "reason": result.get("reason", ""),
+        "retry_count": state.get("retry_count", 0),
+        "from_memory": state.get("from_memory", False),
     })
     return state
