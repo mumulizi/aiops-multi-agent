@@ -43,21 +43,21 @@ def test_critical_before_high():
 # 核心: 同 severity 时, 卡死状态优先 (修复用户反馈的 bug)
 # ===============================================================
 def test_imagepull_priority_over_high_restart_unhealthy():
-    """实战 case: noaheepro/ImagePullError (restart=0, high) 应排在
+    """实战 case: abcd/ImagePullError (restart=0, high) 应排在
     fluid-system/Unhealthy (restart=666, high) 前面.
     """
     issues = (
         # fluid-system 的 5 个 Unhealthy Pod, 重启 666 次
         [_issue("fluid-system", f"test-pvc-{i}", "Unhealthy", "high",
                 restarts=666, reason="Completed") for i in range(5)]
-        # noaheepro 的 7 个 ImagePullError Pod, 重启 0
-        + [_issue("noaheepro", f"probe-agent-{i}", "ImagePullError", "high",
+        # abcd 的 7 个 ImagePullError Pod, 重启 0
+        + [_issue("abcd", f"probe-agent-{i}", "ImagePullError", "high",
                   restarts=0, reason="ImagePullBackOff") for i in range(7)]
     )
     out = _group_similar_issues(issues)
     # 第一组应该是 ImagePullError (卡死状态优先)
     assert out[0][0]["type"] == "ImagePullError"
-    assert out[0][0]["namespace"] == "noaheepro"
+    assert out[0][0]["namespace"] == "abcd"
     # 第二组才是 Unhealthy
     assert out[1][0]["type"] == "Unhealthy"
 
@@ -193,15 +193,15 @@ def test_daemonset_prefix_drops_one_segment():
     """DaemonSet Pod: <ds-name>-<hash>, 去最后 1 段."""
     from main_inspect import _service_prefix
     assert _service_prefix("dcgm-exporter-75h9v", "DaemonSet") == "dcgm-exporter"
-    assert _service_prefix("noaheepro-noaheeops-probe-agent-77szl",
-                            "DaemonSet") == "noaheepro-noaheeops-probe-agent"
+    assert _service_prefix("abcd-abcd-probe-agent-77szl",
+                            "DaemonSet") == "abcd-abcd-probe-agent"
 
 
 def test_statefulset_prefix_drops_ordinal():
     """StatefulSet Pod: <sts-name>-<ordinal>, 去最后 1 段."""
     from main_inspect import _service_prefix
-    assert _service_prefix("noaheepro-noaheeops-task-manager-0",
-                            "StatefulSet") == "noaheepro-noaheeops-task-manager"
+    assert _service_prefix("abcd-abcd-task-manager-0",
+                            "StatefulSet") == "abcd-abcd-task-manager"
 
 
 def test_barepod_prefix_drops_one_segment():

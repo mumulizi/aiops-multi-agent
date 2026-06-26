@@ -25,7 +25,7 @@ def test_standard_format():
 def test_chinese_colon():
     """中文冒号 ：也要识别."""
     text = (
-        "根因：noaheeops-task-manager 配置文件路径错.\n"
+        "根因：abcd-task-manager 配置文件路径错.\n"
         "置信度：中\n"
         "关键证据：no such file or directory"
     )

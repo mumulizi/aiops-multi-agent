@@ -70,7 +70,7 @@ def _service_prefix(pod_name: str, owner_kind: str) -> str:
     - dcgm-exporter-75h9v (DaemonSet)                            → dcgm-exporter
     - device-plugin-patch-5vw58 (DaemonSet)                      → device-plugin-patch
     - baremetal-operator-controller-manager-7466749c9f-q98kw (RS) → baremetal-operator-controller-manager
-    - noaheepro-noaheeops-task-manager-0 (StatefulSet)           → noaheepro-noaheeops-task-manager
+    - abcd-abcd-task-manager-0 (StatefulSet)           → abcd-abcd-task-manager
 
     这样 dcgm-exporter / device-plugin-patch / kube-external-auditor 三个不同服务
     在同 ns + 同 type (CrashLoopBackOff) 时会分到三组, 各自被诊断. 准确性优先.

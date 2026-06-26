@@ -446,7 +446,7 @@ pytest tests/test_policy.py -v
 **Bug 3**: 策略过滤位置太晚, Top 10 显示被忽略的 Pod
 - 之前 v2.6 把过滤放在 `main_inspect._run_cycle_body`, 在 Inspector 已经
   打印完 Top 10 之后
-- 视觉上看到 noaheepro 的 Pod 还在 Top 10 里 (虽然实际调度器拿到的是 23 个,
+- 视觉上看到 abcd 的 Pod 还在 Top 10 里 (虽然实际调度器拿到的是 23 个,
   过滤了 9 个), 容易误判为"策略没生效"
 
 #### 改动

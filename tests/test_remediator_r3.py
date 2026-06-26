@@ -5,7 +5,7 @@ R3 是 v2.2 新增的强制规则:
 - 或 alertname 命中 RunContainerError / ImagePullBackOff 等
 → 强制 action=none, 标 escalate_human, 不让 restart 假修复.
 
-关键场景: 实战里出现过 noaheeops-task-manager-0 被 R2 强制成 restart_statefulset_pod L2,
+关键场景: 实战里出现过 abcd-task-manager-0 被 R2 强制成 restart_statefulset_pod L2,
 但根因是 config.yaml 路径错, 重启 1000 次也没用. R3 在这之上再覆盖一层, 截断假修复.
 """
 from agents.remediator import _post_process_plan, _is_non_restartable_failure
@@ -103,7 +103,7 @@ def test_R3_restart_pod_forced_to_none_by_rca():
 
 
 def test_R3_restart_statefulset_pod_forced_to_none():
-    """实战 case: noaheeops-task-manager-0 (StatefulSet) 配置文件错.
+    """实战 case: abcd-task-manager-0 (StatefulSet) 配置文件错.
     R2 之前会强制成 restart_statefulset_pod, R3 再覆盖一层成 none."""
     plan = {
         "action": "none",  # LLM 给的 none
