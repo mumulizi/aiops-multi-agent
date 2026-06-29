@@ -7,6 +7,7 @@ import uuid
 from collections import defaultdict
 
 from agents.inspector import run_inspector
+from agents.metrics_inspector import run_metrics_inspector
 from graph import build_graph
 from tools.langfuse_setup import (
     LANGFUSE_HANDLER,
@@ -35,12 +36,30 @@ def _issue_to_alert(issue):
     reason = (issue.get("reason") or "")[:200]
     deep = (issue.get("deep_finding") or "")[:300]
     owner_kind = issue.get("owner_kind", "Unknown")
-    parts = [f"Pod {ns}/{pod} on node {node} owner={owner_kind}"]
-    parts.append(f"phase={phase} restarts={restarts}")
-    parts.append(f"reason: {reason}")
-    if deep:
-        parts.append(f"Inspector 收集的细节: {deep}")
-    description = " | ".join(parts)
+    source = issue.get("source", "pod")
+
+    # v2.12: metric 来源的 issue 拼装方式不同 — 重点是 metric_query + value
+    if source == "metrics":
+        mq = (issue.get("metric_query") or "")[:200]
+        mv = issue.get("metric_value", "?")
+        labels = issue.get("metric_labels") or {}
+        # 取几个关键 label 摘要
+        keep = {k: v for k, v in labels.items()
+                if k in ("pod", "namespace", "instance", "node", "container")}
+        parts = [f"指标异常 (来源 MetricsInspector)"]
+        parts.append(f"PromQL: {mq}")
+        parts.append(f"当前值: {mv}")
+        if keep:
+            parts.append(f"关键 labels: {keep}")
+        description = " | ".join(parts)
+    else:
+        parts = [f"Pod {ns}/{pod} on node {node} owner={owner_kind}"]
+        parts.append(f"phase={phase} restarts={restarts}")
+        parts.append(f"reason: {reason}")
+        if deep:
+            parts.append(f"Inspector 收集的细节: {deep}")
+        description = " | ".join(parts)
+
     return {
         "labels": {
             "alertname": typ,
@@ -49,6 +68,7 @@ def _issue_to_alert(issue):
             "instance": pod,
             "node": node,
             "owner_kind": owner_kind,
+            "source": source,
         },
         "annotations": {
             "summary": summary,
@@ -162,6 +182,18 @@ def run_one_inspection_cycle(top_n=20, deep_max_steps=8, dedup=True):
 
 def _run_cycle_body(cycle_id, top_n, deep_max_steps, dedup, cycle_trace):
     issues = run_inspector(top_n=None, deep_max_steps=deep_max_steps)
+
+    # v2.12: MetricsInspector 并行采集指标层异常, merge 到同一个 issues 列表
+    metric_issues = []
+    try:
+        metric_issues = run_metrics_inspector()
+    except Exception as e:
+        _log(f"[调度器] MetricsInspector 失败, 跳过 (不影响主流程): {e}")
+    if metric_issues:
+        _log(f"[调度器] MetricsInspector 贡献 {len(metric_issues)} 个指标异常, "
+             f"合并到调度队列")
+        issues = (issues or []) + metric_issues
+
     if not issues:
         _log("[调度器] 集群无异常, 周期结束")
         end_cycle_trace(cycle_trace, output={"reports": [], "total_issues": 0})
