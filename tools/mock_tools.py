@@ -80,10 +80,22 @@ def query_history_alerts(alertname: str, days: int = 7) -> str:
     return "\n".join(lines)
 
 
+from tools.change_tracker import get_recent_changes as _real_get_recent_changes
+
+
+def get_recent_changes(namespace: str, hours: int = 2) -> str:
+    """变更追踪: 查 namespace 最近 N 小时的 Deployment/RS/ConfigMap/Secret/Event 变更.
+
+    用于 Investigator 判断故障是否由近期变更引起 (业界 80% 故障由变更触发).
+    """
+    return _real_get_recent_changes(namespace=namespace, hours=hours)
+
+
 TOOLS = {
     "prometheus_query": prometheus_query,
     "kubectl_describe": kubectl_describe,
     "query_history_alerts": query_history_alerts,
+    "get_recent_changes": get_recent_changes,
 }
 
 _PROM_HINT = (
@@ -97,6 +109,11 @@ TOOL_DESCRIPTIONS = {
     "prometheus_query": _PROM_HINT,
     "kubectl_describe": "真实查 K8s Pod 详情和事件. 参数 resource(必须是 pod), name, namespace.",
     "query_history_alerts": "查集群当前所有出现某种类型问题的 Pod. 参数 alertname(如 CrashLoopBackOff/OOMKilled), days.",
+    "get_recent_changes": (
+        "查 namespace 最近 N 小时内的 K8s 资源变更 (Deployment/ReplicaSet/"
+        "StatefulSet/ConfigMap/Secret/Event). 用于判断故障是否由近期发布或"
+        "配置变更引起. 参数 namespace(必填), hours(默认 2, 最大 24)."
+    ),
 }
 
 

@@ -136,6 +136,35 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_changes",
+            "description": (
+                "查询指定 namespace 最近 N 小时内的 K8s 资源变更 "
+                "(Deployment / ReplicaSet / StatefulSet / ConfigMap / Secret / Event). "
+                "用于判断故障是否由近期发布或配置变更触发 "
+                "(业界统计: ~80% 生产故障由变更引起). "
+                "返回按时间倒序的变更列表, 最多 50 条. "
+                "适合诊断刚开始飙的 CrashLoop / OOM / 5xx 突涨等故障."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "namespace": {
+                        "type": "string",
+                        "description": "K8s namespace, 必填",
+                    },
+                    "hours": {
+                        "type": "integer",
+                        "description": "回溯小时数, 默认 2, 最大 24",
+                        "default": 2,
+                    },
+                },
+                "required": ["namespace"],
+            },
+        },
+    },
 ]
 
 
