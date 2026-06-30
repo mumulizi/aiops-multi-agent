@@ -49,6 +49,10 @@
   - **MetricsInspector**: 跟 Inspector 并行的指标层巡检 Agent (无 LLM), 6 条内置 PromQL 规则 (CPU 节流 / 内存逼近 limit / 节点磁盘压力 / load 高 / apiserver 5xx / kubelet 失联), 把"Pod 崩了再修"升级为"SLO 异常→主动诊断"
   - **Validator 异步化**: 主流程内 T+0 立即返回 `pending_async` 不阻塞调度; SQLite 任务表 + daemon 线程 30s/2min/10min 三轮异步验证; 终态推第二条 IM; `VALIDATOR_ASYNC=false` 一键回退到 v2.11 同步行为
   - 配套 CLI: `scripts/aiops_verify_status.py` 看异步任务表 (`--pending` / `--json` / `--limit`)
+- **v2.13 自主执行 (Readonly Tier A)**: Investigator 新增 `ssh_node_readonly` + `kubectl_exec_readonly` 两个只读工具, 让它像 Claude Code 那样自主跑 `lsmod / dmesg / journalctl / cat /etc/...` 等命令实地查证再下结论 (而不是只给"建议节点运维检查").
+  - 安全闸: 命令前缀白名单 + 子命令二级白名单 + dangerous token 黑名单 (rm/sed -i/systemctl restart/kubectl 写操作/curl POST 等 60+ token) + 重定向/反引号/`$()` 字符级拦截 + ssh 节点必须在 K8s nodes 列表
+  - 资源闸: 单命令 10s 超时 + 输出截断 4KB + (node, prefix) 1h 5 次速率
+  - 跟 L3/L2/L4 修复路径不重叠: 只管只读诊断, 任何状态变更继续走 Remediator → ApprovalGate → Executor
 - **本地 LLM**: Qwen2.5-32B-Instruct-AWQ 在 2 卡 Tesla T4 上 vLLM TP=2 部署 (从 7B 升级而来),
   OpenAI 兼容接口; 也可通过 env 切换关键 Agent 走云 API 强模型 (混合架构,
   DeepSeek-V3 / 通义千问 API / 任何 OpenAI 兼容端点)
@@ -162,9 +166,10 @@ aiops-multi-agent/
 │   └── notifier.py          # 通知输出 (含完整自愈链路报告 + IM 推送 + region 标识)
 ├── tools/                   # 工具集
 │   ├── k8s_tools.py         # K8s API 真实工具(异常列表/Pod 详情/多容器日志)
-│   ├── mock_tools.py        # Investigator 工具集 (PromQL/describe/历史/日志/变更追踪, v2.12)
-│   ├── tool_schemas.py      # Function Calling 严格 JSON Schema (v2.9, 5 工具的 type/required/enum 约束)
+│   ├── mock_tools.py        # Investigator 工具集 (PromQL/describe/历史/日志/变更追踪/ssh+exec, v2.13)
+│   ├── tool_schemas.py      # Function Calling 严格 JSON Schema (v2.13, 7 工具的 type/required/enum 约束)
 │   ├── change_tracker.py    # 变更追踪 (v2.12, K8s Deployment/RS/CM/Secret/Event 变更查询)
+│   ├── ssh_tools.py         # 只读 shell 执行 (v2.13, ssh+kubectl exec 白名单/黑名单/4 道安全闸)
 │   ├── metrics_rules.py     # MetricsInspector 内置 PromQL 规则集 (v2.12)
 │   ├── remediation_actions.py  # L3/L2 修复动作 (Pod/Node/Deployment 级)
 │   ├── safety_guards.py     # 速率限制 (v2.12 SQLite 持久化) + 审计日志 (内存)
@@ -712,6 +717,13 @@ export VERIFIER_LOOP_SEC=5        # worker 主循环扫表间隔 (默认 5s)
 export AIOPS_DB_PATH=data/aiops.db   # 速率限制 + 异步任务表统一存储
 export METRICS_INSPECTOR_ENABLED=true   # v2.12 指标层巡检, false 关闭
 export PROM_BASE_URL=http://<prom-host>:port/select/1/prometheus   # 同 MetricsInspector 和 mock_tools.prometheus_query 共用
+
+# v2.13 Investigator 自主执行只读 shell (默认开)
+export READONLY_EXEC_ENABLED=true       # false 一键关掉 ssh / kubectl exec
+export SSH_USER=root                    # ssh 登录用户 (默认 root)
+export SSH_KEY_PATH=                    # 默认空, 用系统 ssh-agent 或 ~/.ssh/id_rsa
+export SSH_STRICT_HOST_CHECK=no         # 兼容跳板机, 生产建议 yes
+export SSH_CMD_TIMEOUT_SEC=10           # 单命令超时 (默认 10s)
 
 # IM 通知 (可选, 不设则只写本地 alerts/ 文件)
 export IM_PROVIDER=infoflow         # infoflow / dingtalk / wecom / feishu
