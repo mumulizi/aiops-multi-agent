@@ -25,12 +25,14 @@ _DECISION_ICON = {
 }
 
 _VALIDATION_ICON = {
-    "success":  "✓",
-    "partial":  "~",
-    "pending":  "?",
-    "failed":   "✗",
-    "timeout":  "⏰",
-    "skipped":  "-",
+    "success":        "✓",
+    "partial":        "~",
+    "pending":        "?",
+    "pending_async":  "⏳",
+    "failed":         "✗",
+    "timeout":        "⏰",
+    "skipped":        "-",
+    "escalate_human": "🚨",
 }
 
 

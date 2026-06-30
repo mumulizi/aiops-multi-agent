@@ -54,13 +54,18 @@ def _route_by_severity(state: AlertState) -> str:
 
 
 def _route_after_validator(state: AlertState) -> str:
-    """v2.3 Validator 后路由:
+    """v2.3 Validator 后路由 (v2.12 加 pending_async 支持):
+    - pending_async (异步路径派单后) → Notifier (不阻塞, 后台 worker 继续验证)
     - failed + 未达重试上限 → 回 Investigator 重新诊断
     - 其他 → Notifier (success/pending/escalate_human/skipped 都走通知)
     """
     result = state.get("validation_result") or {}
     status = result.get("status", "")
     retry_count = state.get("retry_count", 0)
+
+    # v2.12: 异步路径下, validator 立即返回 pending_async, 主流程走 notifier 派单通知
+    if status == "pending_async":
+        return "notifier"
 
     if status == "failed" and retry_count < _max_retries():
         return "investigator"

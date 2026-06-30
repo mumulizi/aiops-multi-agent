@@ -36,9 +36,10 @@ class AlertState(TypedDict, total=False):
     snapshot_after: Optional[dict]
 
     # === Validator 写 (Phase 4) ===
-    # {status: success|failed|timeout|skipped|escalate_human|pending, verified_at, reason}
+    # {status: success|failed|timeout|skipped|escalate_human|pending|pending_async, verified_at, reason}
     # escalate_human: "重启无救"型故障, IM 用 🚨 推
     # pending: 30s 内未恢复, 但也未明确 failed
+    # pending_async (v2.12): 已派单异步验证, 主流程不阻塞, daemon 30s/2min/10min 三轮复查
     # failed: 重启次数继续涨 +5 / 状态恶化, 触发 v2.3 闭环回到 Investigator
     validation_result: Optional[dict]
 

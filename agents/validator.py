@@ -1,7 +1,11 @@
 """Validator Agent: 修复后的健康检查.
 
-注意: 默认是"轻量验证" - 只等 30s 看一次 (避免主流程被阻塞 10 分钟).
-完整版 30s/2min/10min 三次检查在异步模式 (TODO: 后续 Celery / asyncio).
+v2.12 升级: 默认走异步路径 (VALIDATOR_ASYNC=true)
+- 主流程内只做 T+0 立即检查 + "重启无救" 命中判定
+- 长时间复查 (30s/2min/10min) 交给 agents.verifier_worker daemon 线程
+- 调度不再被单 Pod 30s 阻塞
+
+VALIDATOR_ASYNC=false 回退到旧 sync 路径 (30s 单次检查), 保留兼容性.
 """
 import os
 import sys
@@ -19,11 +23,16 @@ def _log(msg):
 
 
 def _wait_seconds() -> int:
-    """主流程内的验证等待时间 (默认 30s)"""
+    """sync 路径下的验证等待时间 (默认 30s). 异步路径不用这个."""
     try:
         return int(os.getenv("VALIDATOR_WAIT_SEC", "30"))
     except Exception:
         return 30
+
+
+def _is_async() -> bool:
+    """是否走异步路径 (默认 true). 设 false 走旧 sync 30s 等待."""
+    return os.getenv("VALIDATOR_ASYNC", "true").lower() == "true"
 
 
 # "重启无救" 型异常 reason 集合.
@@ -108,6 +117,8 @@ def validator_node(state: AlertState) -> AlertState:
     - executed + Pod Ready + 重启次数没继续涨 → success
     - executed + 重启 +5 → failed (修复无效, 触发再诊断)
     - dry_run / skipped / rejected → skipped (没执行就不验证)
+
+    v2.12: 默认 VALIDATOR_ASYNC=true, 走异步路径 (T+0 + 任务表入队 + worker 后续验证).
     """
     exec_status = state.get("execution_status", "")
     plan = state.get("remediation_plan") or {}
@@ -133,22 +144,91 @@ def validator_node(state: AlertState) -> AlertState:
         }
         return state
 
+    # === 异步路径 (v2.12 默认) ===
+    if _is_async():
+        return _validator_async_path(state, ns, name, target, plan)
+
+    # === 同步路径 (回退) ===
+    return _validator_sync_path(state, ns, name, target, plan)
+
+
+def _validator_async_path(state, ns, name, target, plan) -> AlertState:
+    """异步路径: T+0 检查 + 写任务表 + 立即返回 pending_async.
+
+    T+0 检查只看两件事 (主流程不阻塞):
+    1. 重启无救型故障 → 直接 escalate_human (这种再等也没用)
+    2. 否则 → enqueue 异步任务, 写 validation_result.status=pending_async
+
+    长时间复查交给 verifier_worker daemon 线程.
+    """
+    from tools import verifier_store
+
+    # 立即拿一次快照看是否命中 "重启无救"
+    snap_now = _capture_pod_state(ns, name)
+    state["snapshot_after"] = snap_now
+
+    is_futile, futile_reasons = _diagnose_restart_futility(snap_now)
+    if is_futile:
+        result = {
+            "status": "escalate_human",
+            "verified_at": "t+0",
+            "reason": (
+                f"重启无救型故障 (waiting.reason={','.join(futile_reasons)}); "
+                f"根因不在 runtime, 重启不解决问题, 请人工检查配置/镜像/启动参数"
+            ),
+            "futile_reasons": futile_reasons,
+        }
+        state["validation_result"] = result
+        _log(f"[Validator] ⚠ {result['status']} (T+0 即判定): "
+             f"{result['reason'][:100]}")
+        record_audit({
+            "stage": "validator", "trace_id": state.get("trace_id"),
+            "target": target, "result": result["status"],
+            "reason": result["reason"], "mode": "async-t+0",
+        })
+        return state
+
+    # 排进异步队列
+    try:
+        task_id = verifier_store.enqueue(state, plan)
+    except Exception as e:
+        # 入队失败兜底 → 回退到 sync 路径单次验证
+        _log(f"[Validator] ⚠ 异步入队失败 ({e}), 回退 sync 一次性验证")
+        return _validator_sync_path(state, ns, name, target, plan)
+
+    state["validation_result"] = {
+        "status": "pending_async",
+        "verified_at": "t+0",
+        "reason": "已派单异步验证 (30s / 2min / 10min 三轮覆盖)",
+        "task_id": task_id,
+    }
+    _log(f"[Validator] ⏳ 派单异步验证 task_id={task_id[:12]} "
+         f"target={target} action={plan.get('action')}")
+    record_audit({
+        "stage": "validator", "trace_id": state.get("trace_id"),
+        "target": target, "result": "pending_async",
+        "task_id": task_id, "mode": "async",
+    })
+    return state
+
+
+def _validator_sync_path(state, ns, name, target, plan) -> AlertState:
+    """旧 sync 路径: 主流程内 sleep 30s 等 Pod 稳定. 通过 VALIDATOR_ASYNC=false 启用."""
     snap_before = state.get("snapshot_before") or {}
     before_restarts = snap_before.get("total_restarts", 0)
 
     wait_sec = _wait_seconds()
-    _log(f"[Validator] waiting {wait_sec}s for pod to stabilize...")
+    _log(f"[Validator] (sync) waiting {wait_sec}s for pod to stabilize...")
     time.sleep(wait_sec)
 
     snap_now = _capture_pod_state(ns, name)
     state["snapshot_after"] = snap_now
 
-    # 优先检查"重启无救"型故障: 重启完仍是 RunContainerError/ImagePullBackOff/...
-    # 这种状态再多重启 N 次也是同样的错, 必须升级人审而不是循环重试.
+    # 优先检查 "重启无救" 型故障
     is_futile, futile_reasons = _diagnose_restart_futility(snap_now)
     if is_futile:
         result = {
-            "status": "escalate_human",  # 区别于 success/failed/pending
+            "status": "escalate_human",
             "verified_at": f"{_wait_seconds()}s",
             "reason": (
                 f"重启无救型故障 (waiting.reason={','.join(futile_reasons)}); "
@@ -166,7 +246,6 @@ def validator_node(state: AlertState) -> AlertState:
         return state
 
     if snap_now.get("error"):
-        # Pod 不存在了: 区分情况
         action = plan.get("action", "")
         if action in ("delete_evicted_pod", "delete_completed_job_pod"):
             result = {
@@ -175,10 +254,6 @@ def validator_node(state: AlertState) -> AlertState:
                 "reason": "pod deleted as expected",
             }
         elif action == "restart_pod":
-            # restart_pod = delete + 控制器重建. 旧 Pod 名消失是预期行为.
-            # 进一步: 检查控制器是否真的重建了新 Pod (按 owner 找)
-            owners = (snap_before.get("containers") and []) or []
-            # 简化: 直接看同 namespace 同 prefix 的 Pod 数量是否还在 (DaemonSet/RS 重建会用新名字)
             recreated = _check_pod_recreated_by_owner(ns, name)
             if recreated["found"]:
                 result = {
@@ -190,7 +265,6 @@ def validator_node(state: AlertState) -> AlertState:
                     ),
                 }
             else:
-                # 旧 Pod 删了但新的还没起 → pending (控制器可能还在创建中)
                 result = {
                     "status": "pending",
                     "verified_at": f"{wait_sec}s",
@@ -236,7 +310,6 @@ def validator_node(state: AlertState) -> AlertState:
             "reason": f"restarts continue to grow (+{now_restarts - before_restarts})",
         }
     else:
-        # 30s 还没 Ready, 但也没炸 → 给予观察
         result = {
             "status": "pending",
             "verified_at": f"{wait_sec}s",
@@ -246,15 +319,13 @@ def validator_node(state: AlertState) -> AlertState:
     state["validation_result"] = result
     _log(f"[Validator] {result['status']}: {result.get('reason', '')}")
 
-    # v2.3 故障 Memory: success 时记录修复成功的 (指纹, plan), 给后续同类故障复用
+    # v2.3 故障 Memory: success 时记录修复成功
     if result["status"] == "success":
         fp = state.get("fingerprint")
         if fp and not state.get("from_memory"):
-            # 不复写 from_memory=True 的记录 (它本来就是 Memory 来源)
             try:
                 from tools.fault_memory import record_success
                 rca = state.get("rca_hypothesis", "")
-                # 从 rca 文本里提置信度 (Investigator 输出格式: "...(置信度: 高; ...)")
                 confidence = "中"
                 if "置信度: 高" in rca or "置信度:高" in rca:
                     confidence = "高"
@@ -262,17 +333,17 @@ def validator_node(state: AlertState) -> AlertState:
                     confidence = "低"
                 first_alert = (state.get("raw_alerts") or [{}])[0]
                 labels = first_alert.get("labels") or {}
-                ns = labels.get("namespace", "") or first_alert.get("namespace", "")
+                ns2 = labels.get("namespace", "") or first_alert.get("namespace", "")
                 alertname = labels.get("alertname", "") or \
-                            first_alert.get("alertname", "")
-                record_success(fp, ns, alertname, rca, plan, confidence=confidence)
+                    first_alert.get("alertname", "")
+                record_success(fp, ns2, alertname, rca, plan, confidence=confidence)
                 _log(f"[Validator] 📌 写入 Memory fp={fp} confidence={confidence}")
             except Exception as e:
                 _log(f"[Validator] ⚠ Memory 写入失败 (不影响主流程): {e}")
 
     # v2.3: failed 时记录失败上下文, 给闭环重诊用
     if result["status"] == "failed":
-        state["last_failed_plan"] = dict(plan)  # 拷贝, 避免后续被改
+        state["last_failed_plan"] = dict(plan)
         state["last_failure_reason"] = result.get("reason", "")
         retry_count = state.get("retry_count", 0)
         _log(f"[Validator] ⟳ 失败上下文已记录, 当前 retry_count={retry_count}")

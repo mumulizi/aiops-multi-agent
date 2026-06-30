@@ -431,6 +431,15 @@ if __name__ == "__main__":
     # v2.6: 让 main_loop 拿到 policies 文件路径 (通过环境变量传给 _run_cycle_body)
     if args.policies:
         os.environ["POLICIES_FILE"] = args.policies
+
+    # v2.12: 启动异步验证 daemon 线程 (除非 VALIDATOR_ASYNC=false)
+    if os.getenv("VALIDATOR_ASYNC", "true").lower() == "true":
+        try:
+            from agents.verifier_worker import start as start_verifier
+            start_verifier()
+        except Exception as e:
+            _log(f"[调度器] verifier_worker 启动失败 (不影响主流程): {e}")
+
     main_loop(
         interval_sec=args.interval,
         top_n=args.top,
