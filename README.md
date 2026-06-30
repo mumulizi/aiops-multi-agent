@@ -43,6 +43,12 @@
   二次校验是真 final 还是"思考过程当 final 输出"
   (匹配 `假设/第一步/```json` 等草稿特征 + 缺 "根因:" 标签), 草稿强制重试 1 次后才走兜底,
   彻底治住 32B 模型偶发"用文字描述工具调用"问题
+- **v2.12 P0 改善 (AIOps 平台化第一步)**:
+  - **速率限制 SQLite 持久化** (`data/aiops.db`): 重启不丢状态, 为多副本部署铺路
+  - **变更感知工具 `get_recent_changes`**: Investigator 新工具, 查 namespace 近 N 小时 Deployment/RS/StatefulSet/ConfigMap/Secret/Event 变更, 关联近期发布 → 故障 (业界 80% 故障由变更引起)
+  - **MetricsInspector**: 跟 Inspector 并行的指标层巡检 Agent (无 LLM), 6 条内置 PromQL 规则 (CPU 节流 / 内存逼近 limit / 节点磁盘压力 / load 高 / apiserver 5xx / kubelet 失联), 把"Pod 崩了再修"升级为"SLO 异常→主动诊断"
+  - **Validator 异步化**: 主流程内 T+0 立即返回 `pending_async` 不阻塞调度; SQLite 任务表 + daemon 线程 30s/2min/10min 三轮异步验证; 终态推第二条 IM; `VALIDATOR_ASYNC=false` 一键回退到 v2.11 同步行为
+  - 配套 CLI: `scripts/aiops_verify_status.py` 看异步任务表 (`--pending` / `--json` / `--limit`)
 - **本地 LLM**: Qwen2.5-32B-Instruct-AWQ 在 2 卡 Tesla T4 上 vLLM TP=2 部署 (从 7B 升级而来),
   OpenAI 兼容接口; 也可通过 env 切换关键 Agent 走云 API 强模型 (混合架构,
   DeepSeek-V3 / 通义千问 API / 任何 OpenAI 兼容端点)
@@ -147,25 +153,31 @@ aiops-multi-agent/
 │   ├── classifier.py        # LLM 分类 + 严重度 (集成 Langfuse callback)
 │   ├── investigator.py      # 根因诊断 (v2.9 Function Calling + v2.10 防循环 + v2.11 草稿检测, 集成 Langfuse)
 │   ├── inspector.py         # 主动巡检 (核心, 三阶段, 集成 Langfuse trace)
+│   ├── metrics_inspector.py # 指标层巡检 Agent (v2.12, 6 条内置 PromQL 规则, 无 LLM)
 │   ├── remediator.py        # 修复决策 Agent (v2.0)
 │   ├── approval_gate.py     # 安全分级路由 + 4 层保险 (v2.0) + L2 审批入库
 │   ├── executor.py          # 执行 Agent + T0/T2 快照 (v2.0)
-│   ├── validator.py         # 健康验证 Agent (v2.0)
+│   ├── validator.py         # 健康验证 Agent (v2.12 异步路径, T+0 派单 + 不阻塞)
+│   ├── verifier_worker.py   # 异步验证 daemon 线程 (v2.12, 30s/2min/10min 三轮)
 │   └── notifier.py          # 通知输出 (含完整自愈链路报告 + IM 推送 + region 标识)
 ├── tools/                   # 工具集
 │   ├── k8s_tools.py         # K8s API 真实工具(异常列表/Pod 详情/多容器日志)
-│   ├── mock_tools.py        # Investigator 工具集 (PromQL/describe/历史/日志, v2.10 接受 previous 参数)
-│   ├── tool_schemas.py      # Function Calling 严格 JSON Schema (v2.9, 4 工具的 type/required/enum 约束)
+│   ├── mock_tools.py        # Investigator 工具集 (PromQL/describe/历史/日志/变更追踪, v2.12)
+│   ├── tool_schemas.py      # Function Calling 严格 JSON Schema (v2.9, 5 工具的 type/required/enum 约束)
+│   ├── change_tracker.py    # 变更追踪 (v2.12, K8s Deployment/RS/CM/Secret/Event 变更查询)
+│   ├── metrics_rules.py     # MetricsInspector 内置 PromQL 规则集 (v2.12)
 │   ├── remediation_actions.py  # L3/L2 修复动作 (Pod/Node/Deployment 级)
-│   ├── safety_guards.py     # 速率限制 + 审计日志 (v2.0)
+│   ├── safety_guards.py     # 速率限制 (v2.12 SQLite 持久化) + 审计日志 (内存)
 │   ├── approval_store.py    # SQLite 待审批持久化 + TTL (v2.0+)
+│   ├── verifier_store.py    # SQLite 异步验证任务表 (v2.12)
 │   ├── fault_memory.py      # SQLite 故障 Memory (v2.3, 同指纹复用)
 │   ├── policy.py            # YAML 忽略策略加载 + 匹配 (v2.6)
 │   ├── llm_factory.py       # 统一 LLM 工厂 + region 标识 (v2.8 多集群)
 │   ├── im_notify.py         # IM 通知统一封装 (如流/钉钉/企微/飞书 + 本地审计)
 │   └── langfuse_setup.py    # Langfuse 统一配置 (callback + trace + TraceTimer)
 ├── scripts/                 # CLI 工具
-│   └── aiops_review.py      # L2 审批 CLI (list/show/approve/deny)
+│   ├── aiops_review.py      # L2 审批 CLI (list/show/approve/deny)
+│   └── aiops_verify_status.py # 异步验证任务表 CLI (v2.12, --pending/--json/--limit)
 ├── config/                  # 配置文件
 │   └── policies.yaml.example  # 忽略策略模板 (复制成 policies.yaml 后改)
 ├── alerts/                  # 本地审计文件 (.gitignore 中忽略)
@@ -692,7 +704,14 @@ export LANGFUSE_HOST="http://<your-langfuse-host>:3000"
 export AUTO_HEAL_ENABLED=true     # 大开关 (默认 false, 关闭时所有 L3 降级人审)
 export AUTO_HEAL_DRY_RUN=true     # 仅打印不真执行 (默认 true, 推荐保留直到充分验证)
 export SELF_HEAL_MAX_RETRIES=2    # v2.3 闭环重诊最大次数 (默认 2)
-export VALIDATOR_WAIT_SEC=30      # v2.0 Validator 等待 Pod 稳定的秒数 (默认 30)
+export VALIDATOR_WAIT_SEC=30      # v2.0 Validator 等待 Pod 稳定的秒数 (默认 30, sync 路径用)
+
+# v2.12 异步验证 (默认开, 不阻塞调度; 后台 daemon 30s/2min/10min 三轮复查)
+export VALIDATOR_ASYNC=true       # false 回到 v2.11 sync 30s 行为
+export VERIFIER_LOOP_SEC=5        # worker 主循环扫表间隔 (默认 5s)
+export AIOPS_DB_PATH=data/aiops.db   # 速率限制 + 异步任务表统一存储
+export METRICS_INSPECTOR_ENABLED=true   # v2.12 指标层巡检, false 关闭
+export PROM_BASE_URL=http://<prom-host>:port/select/1/prometheus   # 同 MetricsInspector 和 mock_tools.prometheus_query 共用
 
 # IM 通知 (可选, 不设则只写本地 alerts/ 文件)
 export IM_PROVIDER=infoflow         # infoflow / dingtalk / wecom / feishu

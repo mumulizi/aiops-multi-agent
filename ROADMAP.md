@@ -833,6 +833,163 @@ if not tool_calls:
 
 ---
 
+### v2.12 P0 平台化改善 — 走出"K8s Pod 自愈"上 AIOps 平台 (2026.06.29)
+
+#### 背景
+
+v2.11 之后做了一次全面评估, 结论:
+
+> **这是一个工程实践质量很高的"K8s Pod 层自愈系统", 但还不是真正意义上的 AIOps 平台.**
+> 它在防 LLM 幻觉 / 安全分级 / 代码兜底等**生产工程化**层面做得比 90% 的同类项目都扎实, 但要往 AIOps 平台演进, 还差三块业界标准能力:
+> 1. **检测前移**: 从"Pod 崩了再修"到"SLO 异常→主动诊断"
+> 2. **业务翻译**: 从"运维严重度"到"业务影响度"
+> 3. **变更关联**: 从"看 Pod 内部"到"关联近期变更"
+
+v2.12 选了 4 项 P0 (影响正确性 + 扩展性 + AIOps 含金量) 落地. P1/P2 留到后续版本.
+
+#### 4 项 P0 改善
+
+| # | 项目 | 价值 | 状态 |
+|---|---|---|---|
+| §1 | 速率限制 SQLite 持久化 | 重启不丢状态 + 多副本部署可共享 | ✅ |
+| §2 | 变更感知工具 `get_recent_changes` | 业界 80% 故障由变更引起, 这是 RCA 关键线索 | ✅ |
+| §3 | MetricsInspector + 6 条内置 PromQL | 把"Pod 崩了再修"升级为"SLO 异常→主动诊断" | ✅ |
+| §4 | Validator 异步化 | 调度不阻塞 + 30s/2min/10min 三轮覆盖快慢恢复 | ✅ |
+
+#### §1 速率限制迁 SQLite
+
+**问题**: 旧实现是 `defaultdict(deque)` 内存表 — 进程重启丢状态, 多副本各自计数失效.
+
+**改动**: `tools/safety_guards.py` 新增 SQLite 表 `rate_limit_records` 在 `data/aiops.db`:
+- `allow(target, action, max_per_hour)` 改 SQL: `DELETE` 过期 → `COUNT` 窗口 → `INSERT` 当前
+- 接口签名零变化, 调用方零改动
+- 审计日志保留内存 deque (本期不迁, 学习/单机够用)
+
+**验证**: 同 target 三次 allow 后第四次 → 拒绝; kill -9 进程重启后 1h 内同 target 再触发仍被限流.
+
+#### §2 变更感知工具
+
+**问题**: Investigator 现有工具集都在看"Pod 现在怎么了", 完全不知道"刚才有人改了什么". 业界 AIOps 最常用的 RCA 线索是"近期变更", 这是关键缺口.
+
+**改动**: 新建 `tools/change_tracker.py`, 注册到 Investigator 工具集 (`mock_tools.TOOLS` + `tool_schemas.TOOLS_SCHEMA`):
+```python
+get_recent_changes(namespace: str, hours: int = 2) → str
+```
+数据源 (实时查 K8s API):
+- Deployment 的 revision + lastUpdateTime
+- 新创建的 ReplicaSet (= 新版本部署)
+- StatefulSet condition
+- ConfigMap/Secret 的 managedFields 最新 update time (跳过 SA token 自动生成的)
+- Events: ScalingReplicaSet / SuccessfulCreate / Killing / BackOff
+
+按时间倒序, 最多 50 条. K8s API 失败 → 返回友好错误字符串不抛异常.
+
+**为什么不接 CI/CD webhook**: 需要额外服务端 + 你的环境 CI 平台不确定. 后续真有需要再补.
+
+#### §3 MetricsInspector — 指标层异常前置巡检
+
+**问题**: 旧 Inspector 只看 Pod `phase / waiting / ready`, 漏掉 80% 真实生产故障 — Pod Running 但慢/错的 (P99 飙升 / 5xx 涨 / 内存缓慢泄漏 / 节点磁盘 IO 饱和 / 证书过期...).
+
+**改动**:
+- 新建 `agents/metrics_inspector.py`: 跟 Inspector 并行的代码型 Agent (无 LLM)
+- 新建 `tools/metrics_rules.py`: 6 条内置 K8s 通用 PromQL 规则
+
+| Rule | PromQL | 阈值 | severity |
+|---|---|---|---|
+| `pod_cpu_throttling` | `rate(container_cpu_cfs_throttled_seconds_total[5m])` | >0.5 | high |
+| `pod_memory_near_limit` | `container_memory_working_set_bytes / spec.memory.limit` | >0.9 | high |
+| `node_disk_pressure` | `1 - node_filesystem_avail / size` | >0.85 | high |
+| `node_load_high` | `node_load5 / cpu_count` | >2 | medium |
+| `apiserver_5xx_high` | `sum(rate(apiserver_request_total{code=~"5.."}[5m]))` | >1 req/s | critical |
+| `kubelet_down` | `up{job="kubelet"} == 0` | == 0 | critical |
+
+输出 issue 跟 Pod issue 同结构, 新加 `source=metrics` 字段区分. 调度器接入: `run_inspector + run_metrics_inspector` 结果合并到同一 issues 列表, 共用同类去重逻辑.
+
+**`_issue_to_alert` 对 metric 来源 issue** 用 PromQL 摘要构造 description, 让 Investigator 拿到时优先用 `prometheus_query` 工具深入.
+
+**错误兜底**: 单条规则失败 → 跳过 + 日志; 整体 crash → 调度器 catch, 不阻塞 Inspector; `METRICS_INSPECTOR_ENABLED=false` 一键关闭.
+
+**为什么不上 YAML 配置**: YAGNI, 6 条通用规则覆盖 80% 场景, 后续真有人定制再加 YAML 覆盖层.
+
+#### §4 Validator 异步化
+
+**问题**: 旧 Validator 主流程内 `time.sleep(30)` — 调度被 Pod 数量线性阻塞 (20 个 Pod 都到 executor = 最坏 10min); 且 30s 太短, Pod 重启常需 60-120s 才 ready, 大量产生 `pending` 状态且没有后续异步验证补刀.
+
+**新架构**:
+```
+[同步] Executor → Validator (T+0 立即返回 pending_async) → Notifier 派单通知 → END
+                              ↓ 写 SQLite verification_tasks
+[异步] verifier_worker daemon 线程每 5s 扫表 → 跑 30s/2min/10min 三轮验证 → 终态推第二条 IM
+```
+
+**改动**:
+- 新建 `tools/verifier_store.py`: SQLite 任务表 (`enqueue` / `claim_due` / `update_status` / `list_recent`)
+- 新建 `agents/verifier_worker.py`: daemon 线程, 复用 validator 的 `_diagnose_restart_futility` / `_check_pod_recreated_by_owner` / `_capture_pod_state` 逻辑 (零代码重复)
+- `agents/validator.py` 拆 `_validator_async_path` / `_validator_sync_path`:
+  - **异步路径** (默认): T+0 看 futile 命中 → 否则入队 → 立即返回 `pending_async`
+  - **同步路径**: 保留原 30s sleep, `VALIDATOR_ASYNC=false` 一键回退
+- `graph.py`: `_route_after_validator` 加 `pending_async → notifier` 分支 (不走重诊)
+- `agents/notifier.py`: `_VALIDATION_ICON` 加 `pending_async=⏳` / `escalate_human=🚨`
+- `main_inspect.py`: 启动时拉起 `verifier_worker` (`VALIDATOR_ASYNC=true` 时)
+- 新建 `scripts/aiops_verify_status.py`: CLI 工具看任务表
+
+**三轮验证节奏** (按 `created_at` 偏移):
+- round 0 → 30s (大部分 restart_pod 的 success 在这一轮命中)
+- round 1 → 2min (慢启动的 Pod 在这一轮)
+- round 2 → 10min (兜底)
+- round 3 仍 pending → 终态 `timeout`
+
+**SQLite WAL** 模式保证跨线程读写安全 (跟 fault_memory 一致).
+
+**进程 kill 重启后**: status=pending 的任务保留, worker 启动自动 pick up, `check_at` 过期就立即重试一次.
+
+**不打通 (留 ROADMAP)**: 异步 `failed` 自动跳回 Investigator 重诊 (异步触发主图工程量大 + 失败模式多样, 容易死循环). 本期 `failed` 终态推 IM 告诉运维, 写一条 audit `should_re_diagnose`, 人工 rerun.
+
+**v2.3 失败再诊断闭环** 仅在 sync 路径保留, 异步路径 retry_count 暂不在主图增长.
+
+#### 跨版本对比
+
+| 维度 | v2.11 | v2.12 |
+|---|---|---|
+| 速率限制 | 内存 deque, 进程级 | SQLite, 重启不丢 |
+| 异常检测维度 | Pod phase/waiting/ready | + 6 条 PromQL 指标层规则 |
+| RCA 上下文 | logs / describe / prom / history | + 变更追踪 (Deployment/RS/CM/Secret/Event) |
+| Validator 阻塞 | 30s sleep × N 个 Pod 串行 | T+0 派单不阻塞 + 后台 30s/2min/10min |
+| 验证覆盖 | 1 次 30s | 3 轮 (覆盖快慢恢复) |
+
+#### 新环境变量
+
+- `AIOPS_DB_PATH` (默认 `data/aiops.db`) — 速率限制 + 异步任务表统一存储
+- `METRICS_INSPECTOR_ENABLED` (默认 `true`)
+- `VALIDATOR_ASYNC` (默认 `true`; `false` 回到 v2.11 同步行为)
+- `VERIFIER_LOOP_SEC` (默认 5, worker 主循环扫表间隔)
+- `PROM_BASE_URL` (默认值跟 `mock_tools.VMSELECT_URL` 一致, 显式配置可覆盖)
+
+#### 兼容性
+
+允许小幅 breaking change (`VALIDATOR_ASYNC` 默认 `true`), 但提供 `VALIDATOR_ASYNC=false` 一键回退, 现有逻辑保留.
+
+#### CLI 工具
+
+```bash
+# 看异步验证任务表
+python scripts/aiops_verify_status.py                    # 全部 (pending 优先)
+python scripts/aiops_verify_status.py --pending          # 只看 pending
+python scripts/aiops_verify_status.py --limit 100        # 多看几条
+python scripts/aiops_verify_status.py --json             # 机器可读
+```
+
+#### 未做 (留下个版本)
+
+- **异步失败自动跳回 Investigator 重诊** — 异步路径下 retry_count 不在主图增长
+- **业务影响 Agent** (P1) — 关联 SLO/QPS/受影响用户, 把"运维严重度"翻译成"业务影响度"
+- **服务拓扑感知** (P1) — 区分"受影响 vs 引发", 解决"上游 A 慢 → 下游 B 重启"误诊
+- **故障 Memory 换语义检索** (P1) — 跨 namespace 同类故障复用
+- **诊断质量评估闭环** (P1) — 采样人工标注 + 失败 case 看板
+- **变更感知接 CI/CD webhook** — 当前只看 K8s 层, 不看应用发布平台
+
+---
+
 # 🔥 Tier S — 必做项 (v1.1 已部分完成)
 
 > 这 5 项是从"demo"升级到"生产工程化"的关键。每项都对应 LLM 应用工程的核心痛点。
