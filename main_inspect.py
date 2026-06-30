@@ -60,6 +60,10 @@ def _issue_to_alert(issue):
             parts.append(f"Inspector 收集的细节: {deep}")
         description = " | ".join(parts)
 
+    # v2.12+ fix: metric 来源的 issue 把 MetricsInspector 给的权威 severity 透传到 labels,
+    # 让 Classifier 可以走 fast-path 不再让 LLM 重判 (LLM 看一句话摘要经常把 high 改成 medium).
+    issue_severity = issue.get("severity", "")
+
     return {
         "labels": {
             "alertname": typ,
@@ -69,6 +73,7 @@ def _issue_to_alert(issue):
             "node": node,
             "owner_kind": owner_kind,
             "source": source,
+            "original_severity": issue_severity,
         },
         "annotations": {
             "summary": summary,

@@ -9,6 +9,11 @@
 - 纯代码逻辑, 不调 LLM (跟 Inspector 一致)
 - 单条规则查询失败 → 跳过 + 日志, 不阻塞其他规则
 - 整体 crash → 由调度器 catch, 不阻塞 Inspector
+
+v2.12+ fix: Stale metric 过滤
+- Prometheus 可能保留已下线节点/已删 Pod 的旧指标 (TSDB retention 内, 指标 staleness 5min 期内仍可能返回)
+- 这些 stale 指标转成 issue 会让 Investigator 浪费一步去 describe 找不到的 Pod
+- 跑规则前用 K8s API 一次拿全集群 Pod/Node 名集合, metric label 不在集合里就丢
 """
 import os
 import sys
@@ -27,6 +32,32 @@ TIMEOUT = 8
 def _log(msg):
     print(msg, flush=True)
     sys.stdout.flush()
+
+
+def _load_live_resources() -> tuple:
+    """v2.12+ fix: 一次性拉全集群 Pod 和 Node 名集合, 用于 stale metric 过滤.
+
+    返回 (pod_set, node_set):
+    - pod_set: {(namespace, pod_name), ...} — 全集群存活 Pod
+    - node_set: {node_name, ...} — Ready 节点名
+
+    失败时返回 (None, None), 调用方应该不过滤 (退化为旧行为).
+    """
+    try:
+        from tools.k8s_tools import _v1, _kube_ok
+    except Exception:
+        return None, None
+    if not _kube_ok:
+        return None, None
+    try:
+        pods = _v1.list_pod_for_all_namespaces(timeout_seconds=15).items
+        nodes = _v1.list_node(timeout_seconds=10).items
+    except Exception as e:
+        _log(f"[MetricsInspector] K8s 查询失败, 跳过 stale 过滤: {e}")
+        return None, None
+    pod_set = {(p.metadata.namespace, p.metadata.name) for p in pods}
+    node_set = {n.metadata.name for n in nodes}
+    return pod_set, node_set
 
 
 def _prom_query(query: str) -> list:
@@ -109,12 +140,16 @@ def _make_issue(rule: dict, labels: dict, value: float) -> dict:
     }
 
 
-def _run_rule(rule: dict) -> list:
-    """跑单条规则, 返回 issue 列表 (可能多条时序命中)."""
+def _run_rule(rule: dict, live_pods=None, live_nodes=None) -> list:
+    """跑单条规则, 返回 issue 列表 (可能多条时序命中).
+
+    v2.12+ fix: live_pods/live_nodes 不为 None 时, 过滤掉指 stale 资源的时序.
+    """
     series_list = _prom_query(rule["query"])
     if not series_list:
         return []
     issues = []
+    stale_dropped = 0
     for series in series_list:
         labels = series.get("metric", {}) or {}
         value_pair = series.get("value", [None, None])
@@ -131,7 +166,27 @@ def _run_rule(rule: dict) -> list:
             continue
         if cmp == "==" and not (value == threshold):
             continue
+
+        # v2.12+ fix: stale 检查 — Prom 还有指标但 K8s 里资源已经没了
+        if live_pods is not None and rule.get("label_for_pod"):
+            ns = labels.get(rule.get("label_for_ns", "namespace"), "")
+            pod = labels.get(rule["label_for_pod"], "")
+            if ns and pod and (ns, pod) not in live_pods:
+                stale_dropped += 1
+                continue
+        if live_nodes is not None and rule.get("label_for_node") \
+                and not rule.get("label_for_pod"):
+            node = labels.get(rule["label_for_node"], "")
+            # node label 可能带 :port 后缀 (instance="192.168.48.51:9100")
+            node_name = node.split(":", 1)[0] if node else ""
+            if node_name and node_name not in live_nodes:
+                stale_dropped += 1
+                continue
+
         issues.append(_make_issue(rule, labels, value))
+    if stale_dropped:
+        _log(f"[MetricsInspector]   ⓘ {rule['id']}: 丢弃 {stale_dropped} 条 stale "
+             f"指标 (Prom 还有但 K8s 已无对应资源)")
     return issues
 
 
@@ -150,6 +205,14 @@ def run_metrics_inspector() -> list:
     _log("[MetricsInspector] 启动指标层巡检 (无 LLM)")
     _log("=" * 60)
 
+    # v2.12+ fix: 先拉一次集群存活资源, 用于过滤 stale 指标
+    live_pods, live_nodes = _load_live_resources()
+    if live_pods is not None:
+        _log(f"[MetricsInspector] 集群快照: {len(live_pods)} 个 Pod, "
+             f"{len(live_nodes)} 个 Node (用于 stale 过滤)")
+    else:
+        _log("[MetricsInspector] K8s 不可用, 跳过 stale 过滤 (可能有过期 Pod 指标)")
+
     rules = get_rules()
     all_issues = []
     with TraceTimer("metrics_inspector", "run_all_rules") as t:
@@ -157,7 +220,8 @@ def run_metrics_inspector() -> list:
             rid = rule["id"]
             try:
                 with TraceTimer("metrics_inspector", f"rule:{rid}"):
-                    rule_issues = _run_rule(rule)
+                    rule_issues = _run_rule(rule, live_pods=live_pods,
+                                             live_nodes=live_nodes)
             except Exception as e:
                 _log(f"[MetricsInspector] rule {rid} 失败, 跳过: {e}")
                 continue
