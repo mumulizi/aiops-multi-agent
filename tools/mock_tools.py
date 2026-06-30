@@ -91,11 +91,39 @@ def get_recent_changes(namespace: str, hours: int = 2) -> str:
     return _real_get_recent_changes(namespace=namespace, hours=hours)
 
 
+# === v2.13: 只读 shell 执行工具 (自主诊断 Host / 容器内部) ===
+from tools.ssh_tools import (
+    ssh_run as _real_ssh_run,
+    kubectl_exec_readonly as _real_kubectl_exec_readonly,
+)
+
+
+def ssh_node_readonly(node: str, cmd: str) -> str:
+    """登节点跑只读命令排查 Host 层故障.
+
+    适用场景: 怀疑 driver/kernel/设备文件/系统服务 类问题, 想直接看节点本地状态.
+    白名单: ls/cat/df/free/dmesg/journalctl --no-pager/nvidia-smi/lspci/lsmod/
+            systemctl status/ip/netstat 等. 任何写操作/服务重启/包管理全部拒绝.
+    """
+    return _real_ssh_run(node=node, cmd=cmd)
+
+
+def kubectl_exec_readonly(name: str, namespace: str, cmd: str) -> str:
+    """在 Pod 里跑只读命令查容器内部状态.
+
+    适用场景: 看容器内的 /etc/config 实际内容 / env / 进程 / 网络.
+    白名单跟 ssh_node_readonly 一致.
+    """
+    return _real_kubectl_exec_readonly(name=name, namespace=namespace, cmd=cmd)
+
+
 TOOLS = {
     "prometheus_query": prometheus_query,
     "kubectl_describe": kubectl_describe,
     "query_history_alerts": query_history_alerts,
     "get_recent_changes": get_recent_changes,
+    "ssh_node_readonly": ssh_node_readonly,
+    "kubectl_exec_readonly": kubectl_exec_readonly,
 }
 
 _PROM_HINT = (
@@ -113,6 +141,18 @@ TOOL_DESCRIPTIONS = {
         "查 namespace 最近 N 小时内的 K8s 资源变更 (Deployment/ReplicaSet/"
         "StatefulSet/ConfigMap/Secret/Event). 用于判断故障是否由近期发布或"
         "配置变更引起. 参数 namespace(必填), hours(默认 2, 最大 24)."
+    ),
+    "ssh_node_readonly": (
+        "登节点跑只读命令排查 Host 层故障 (driver/kernel/设备文件/systemd). "
+        "参数 node (K8s 节点名/IP, 必须真实存在), cmd (只读 shell 命令). "
+        "强烈推荐场景: 怀疑 Host 层 → ssh+lsmod/dmesg/ls /dev/*/journalctl --no-pager/nvidia-smi. "
+        "白名单: ls/cat/df/free/dmesg/journalctl/nvidia-smi/lsmod/lspci/systemctl status/"
+        "ip/netstat/ss/ps. 写操作/服务重启/包管理全部拒绝."
+    ),
+    "kubectl_exec_readonly": (
+        "在 Pod 里跑只读命令查容器内部 (/etc/config 实际内容/env/进程/网络). "
+        "参数 name (pod 名), namespace, cmd (只读 shell 命令). "
+        "白名单跟 ssh_node_readonly 一致."
     ),
 }
 

@@ -165,6 +165,75 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ssh_node_readonly",
+            "description": (
+                "登 K8s 节点跑只读 shell 命令, 排查 Host 层故障 "
+                "(NVIDIA driver / 内核模块 / 设备文件 / systemd 服务状态 / 内核日志). "
+                "强烈推荐使用场景: "
+                "(1) 怀疑驱动加载失败 → 执行 lsmod | grep nvidia; "
+                "(2) 怀疑设备文件丢失 → 执行 ls /dev/nvidia*; "
+                "(3) 怀疑内核报错 → 执行 dmesg | grep -i nvidia | tail -50; "
+                "(4) 怀疑 kubelet/containerd 异常 → 执行 journalctl --no-pager -u kubelet -n 100; "
+                "(5) 怀疑内核版本不匹配 → 执行 uname -r 后对照. "
+                "命令白名单: ls/cat/head/tail/grep/find/df/free/dmesg/journalctl --no-pager/"
+                "nvidia-smi (无 -r)/systemctl status/lsmod/lspci/ip/netstat/ss/ps/uname/date. "
+                "禁止: 任何写操作 (rm/mv/sed -i/重定向)/服务重启 (systemctl restart)/"
+                "包管理 (apt/yum)/进程 kill/kubectl 写操作/curl POST. "
+                "被 [Blocked] 时换更窄的只读查询, 不要硬刚."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "K8s 节点名或 IP, 必须出现在 kubectl get nodes 列表",
+                    },
+                    "cmd": {
+                        "type": "string",
+                        "description": "只读 shell 命令, 必须通过白名单校验",
+                    },
+                },
+                "required": ["node", "cmd"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kubectl_exec_readonly",
+            "description": (
+                "在 K8s Pod 内跑只读 shell 命令, 排查容器内部状态 "
+                "(配置文件实际内容 / 环境变量 / 进程列表 / 网络). "
+                "强烈推荐使用场景: "
+                "(1) 怀疑配置文件不存在或内容错 → cat /home/work/.../config.yaml; "
+                "(2) 怀疑环境变量错 → env | grep XXX; "
+                "(3) 怀疑容器内进程异常 → ps aux; "
+                "(4) 看 init 容器留下的产物 → ls /tmp/. "
+                "白名单跟 ssh_node_readonly 一致. 多容器 Pod 默认选第一个容器."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Pod 完整名",
+                    },
+                    "namespace": {
+                        "type": "string",
+                        "description": "Pod 所在 namespace",
+                    },
+                    "cmd": {
+                        "type": "string",
+                        "description": "只读 shell 命令, 必须通过白名单校验",
+                    },
+                },
+                "required": ["name", "namespace", "cmd"],
+            },
+        },
+    },
 ]
 
 
