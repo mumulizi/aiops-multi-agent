@@ -51,6 +51,8 @@ READONLY_PREFIXES = {
     "nvidia-smi", "nvcc", "ldconfig",
     # kubectl 只读 (二级白名单)
     "kubectl",
+    # crictl 容器运行时只读 (节点排查最常用)
+    "crictl",
     # 其他
     "echo",  # echo 本身无害, 不过常被组合恶意; dangerous token 黑名单兜底
     "true", "false",
@@ -66,6 +68,11 @@ SUBCMD_WHITELIST = {
         "status", "show", "list-units", "list-unit-files", "list-jobs",
         "list-dependencies", "is-active", "is-enabled", "is-failed",
         "cat",  # systemctl cat 看 unit 文件内容, 只读
+    },
+    "crictl": {
+        # 全部只读子命令 (排除 pull/rm/run/start/stop/exec)
+        "images", "imagefsinfo", "info", "inspect", "inspecti", "inspectp",
+        "logs", "ps", "pods", "stats", "statsp", "version",
     },
 }
 
@@ -128,8 +135,8 @@ DANGEROUS_TOKENS = (
     "nc", "ncat", "socat",
     "curl -X POST", "curl -X PUT", "curl -X DELETE",
     "curl --data", "curl -d", "wget --post",
-    # docker / containerd 写
-    "docker", "podman", "ctr", "crictl",
+    # docker / containerd 写 (crictl 已经走子命令白名单, 这里只黑 docker/podman/ctr)
+    "docker", "podman", "ctr",
 )
 
 
@@ -200,12 +207,21 @@ def _check_command(cmd: str) -> tuple:
 
     # 1a. 字符级危险符号 (重定向 / 不在单词边界匹配范围)
     # 必须先拆 pipeline 之外的: 这里看的是整条 cmd
-    # 注意我们把 | 当成合法管道, 它后面的段会单独校验, 但 > / >> / 2> 都是写
+    # 注意我们把 | 当成合法管道, 它后面的段会单独校验, 但写文件类重定向都拦
+    #
+    # v2.13 fix: 区分"写文件的重定向" vs "stderr 重定向到合并/丢弃" 两种情况
+    # - 写文件: cmd > /path/file, cmd >> /path/file, cmd 2> /path/file, cmd &> /path/file
+    # - 仅丢弃/合并 stderr (诊断常见, 应放行): 2>/dev/null, 2>&1, &>/dev/null
+    # 用更精确的模式匹配
     char_redirect_patterns = [
-        (r"(?<![<>])>(?!=)", "> 重定向 (写文件)"),     # 排除 <= / >= / >>(单独处理)
-        (r"(?<![<>])>>(?!=)", ">> 追加写"),
-        (r"2>", "2> 错误重定向写"),
-        (r"&>", "&> 全输出重定向写"),
+        # > 跟路径 (写文件), 但允许 >&  (>&1 / >&2 是 fd 重定向不写文件) 和 >=  (比较)
+        # 也允许 &> 后跟 /dev/null (诊断常见)
+        (r"(?<![<>&\d])>(?!=|&|\s*/dev/null\b)", "> 写文件重定向"),
+        (r"(?<![<>&\d])>>(?!=)", ">> 追加写文件"),
+        # 2> 后必须是 &1 (合并) 或 /dev/null (丢弃) 才放行; 写到具体文件拦
+        (r"\b2>(?!&\d|\s*/dev/null\b)", "2> 写文件重定向"),
+        # &> 类似
+        (r"&>(?!\s*/dev/null\b)", "&> 写文件重定向"),
         (r"`[^`]+`", "反引号命令替换 (绕过校验风险)"),
         (r"\$\([^)]+\)", "$() 命令替换 (绕过校验风险)"),
     ]

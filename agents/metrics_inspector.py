@@ -37,27 +37,46 @@ def _log(msg):
 def _load_live_resources() -> tuple:
     """v2.12+ fix: 一次性拉全集群 Pod 和 Node 名集合, 用于 stale metric 过滤.
 
-    返回 (pod_set, node_set):
+    v2.13+ fix: 同时拉 (ns, pod) → owner_kind 映射, 给 metric issue 填真实 owner
+    (避免 Remediator 把 DaemonSet 的 rdma-agent 误判为 BarePod).
+
+    返回 (pod_set, node_set, pod_owner_map):
     - pod_set: {(namespace, pod_name), ...} — 全集群存活 Pod
     - node_set: {node_name, ...} — Ready 节点名
+    - pod_owner_map: {(namespace, pod_name): owner_kind} — owner_kind ∈
+        {"ReplicaSet", "DaemonSet", "StatefulSet", "Job", "BarePod"}
 
-    失败时返回 (None, None), 调用方应该不过滤 (退化为旧行为).
+    失败时返回 (None, None, {}), 调用方应该不过滤 (退化为旧行为).
     """
     try:
         from tools.k8s_tools import _v1, _kube_ok
     except Exception:
-        return None, None
+        return None, None, {}
     if not _kube_ok:
-        return None, None
+        return None, None, {}
     try:
         pods = _v1.list_pod_for_all_namespaces(timeout_seconds=15).items
         nodes = _v1.list_node(timeout_seconds=10).items
     except Exception as e:
         _log(f"[MetricsInspector] K8s 查询失败, 跳过 stale 过滤: {e}")
-        return None, None
-    pod_set = {(p.metadata.namespace, p.metadata.name) for p in pods}
+        return None, None, {}
+
+    VALID_CONTROLLERS = {"ReplicaSet", "DaemonSet", "StatefulSet", "Job"}
+    pod_set = set()
+    pod_owner_map = {}
+    for p in pods:
+        key = (p.metadata.namespace, p.metadata.name)
+        pod_set.add(key)
+        owner_kind = "BarePod"
+        for o in (p.metadata.owner_references or []):
+            is_controller = getattr(o, "controller", False)
+            if is_controller and o.kind in VALID_CONTROLLERS:
+                owner_kind = o.kind
+                break
+        pod_owner_map[key] = owner_kind
+
     node_set = {n.metadata.name for n in nodes}
-    return pod_set, node_set
+    return pod_set, node_set, pod_owner_map
 
 
 def _prom_query(query: str) -> list:
@@ -80,13 +99,17 @@ def _prom_query(query: str) -> list:
     return data.get("data", {}).get("result", []) or []
 
 
-def _make_issue(rule: dict, labels: dict, value: float) -> dict:
+def _make_issue(rule: dict, labels: dict, value: float,
+                pod_owner_map: dict = None) -> dict:
     """把一条命中规则的时序转成 issue (跟 Pod issue 结构对齐).
 
     关键字段:
     - source="metrics" 用于下游区分
     - type 用 rule["type"] (PascalCase, 跟 Pod 的 CrashLoopBackOff 这种风格一致)
     - pod 字段尽量填: 有 pod label 就用, 否则填 "(metric)"
+    - owner_kind (v2.13+ fix): 通过 pod_owner_map 查真实 owner, 避免 Remediator
+      把 DaemonSet 误判为 BarePod (BarePod 走 R1 强制 action=none, 但 DaemonSet
+      的 CPU 节流应该走 scale_deployment 等动作)
     """
     rid = rule["id"]
     rtype = rule["type"]
@@ -120,13 +143,18 @@ def _make_issue(rule: dict, labels: dict, value: float) -> dict:
         f"超阈值 {threshold} ({desc})"
     )
 
+    # v2.13+ fix: 从 pod_owner_map 查真实 owner_kind
+    owner_kind = "Unknown"
+    if pod_owner_map and pod and pod != "(metric)" and not pod.startswith("node:"):
+        owner_kind = pod_owner_map.get((ns, pod), "Unknown")
+
     return {
         "namespace": ns,
         "pod": pod,
         "type": rtype,
         "severity": severity,
         "summary": summary,
-        "owner_kind": "Unknown",  # MetricsInspector 不查 owner
+        "owner_kind": owner_kind,  # v2.13+ 真实 owner
         "restarts": 0,
         "phase": "",
         "reason": "metric_anomaly",
@@ -140,10 +168,12 @@ def _make_issue(rule: dict, labels: dict, value: float) -> dict:
     }
 
 
-def _run_rule(rule: dict, live_pods=None, live_nodes=None) -> list:
+def _run_rule(rule: dict, live_pods=None, live_nodes=None,
+              pod_owner_map: dict = None) -> list:
     """跑单条规则, 返回 issue 列表 (可能多条时序命中).
 
     v2.12+ fix: live_pods/live_nodes 不为 None 时, 过滤掉指 stale 资源的时序.
+    v2.13+ fix: 透传 pod_owner_map 给 _make_issue 填真实 owner_kind.
     """
     series_list = _prom_query(rule["query"])
     if not series_list:
@@ -183,7 +213,7 @@ def _run_rule(rule: dict, live_pods=None, live_nodes=None) -> list:
                 stale_dropped += 1
                 continue
 
-        issues.append(_make_issue(rule, labels, value))
+        issues.append(_make_issue(rule, labels, value, pod_owner_map=pod_owner_map))
     if stale_dropped:
         _log(f"[MetricsInspector]   ⓘ {rule['id']}: 丢弃 {stale_dropped} 条 stale "
              f"指标 (Prom 还有但 K8s 已无对应资源)")
@@ -206,10 +236,11 @@ def run_metrics_inspector() -> list:
     _log("=" * 60)
 
     # v2.12+ fix: 先拉一次集群存活资源, 用于过滤 stale 指标
-    live_pods, live_nodes = _load_live_resources()
+    # v2.13+ fix: 同时拿 pod → owner_kind 映射, 让 issue 带真实 owner
+    live_pods, live_nodes, pod_owner_map = _load_live_resources()
     if live_pods is not None:
         _log(f"[MetricsInspector] 集群快照: {len(live_pods)} 个 Pod, "
-             f"{len(live_nodes)} 个 Node (用于 stale 过滤)")
+             f"{len(live_nodes)} 个 Node (用于 stale 过滤 + owner_kind 填充)")
     else:
         _log("[MetricsInspector] K8s 不可用, 跳过 stale 过滤 (可能有过期 Pod 指标)")
 
@@ -221,7 +252,8 @@ def run_metrics_inspector() -> list:
             try:
                 with TraceTimer("metrics_inspector", f"rule:{rid}"):
                     rule_issues = _run_rule(rule, live_pods=live_pods,
-                                             live_nodes=live_nodes)
+                                             live_nodes=live_nodes,
+                                             pod_owner_map=pod_owner_map)
             except Exception as e:
                 _log(f"[MetricsInspector] rule {rid} 失败, 跳过: {e}")
                 continue
