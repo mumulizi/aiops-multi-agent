@@ -248,3 +248,105 @@ def stats() -> dict:
         "total_hits": total_hits,
         "avg_hits_per_entry": (total_hits / total) if total > 0 else 0,
     }
+
+
+# === v2.14: 诊断命令历史 (审批通过执行后写入, 下次同指纹故障复用) ===
+
+# diagnostic_cmd_history 表跟 fault_memory 一起放 (同一 DB), 但独立 schema
+# 这样 Investigator 命中 Memory 时可以同时拉历史命令.
+
+def _conn_with_diag():
+    """带 diagnostic_cmd_history 表的 connection."""
+    c = _conn()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS diagnostic_cmd_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT NOT NULL,
+            trace_id    TEXT,
+            node        TEXT,
+            namespace   TEXT,
+            pod         TEXT,
+            cmd         TEXT NOT NULL,
+            reason      TEXT,
+            exit_code   INTEGER,
+            stdout_head TEXT,
+            stderr_head TEXT,
+            approved_by TEXT,
+            approval_id TEXT,
+            executed_at INTEGER NOT NULL
+        )
+    """)
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_diag_fp
+                 ON diagnostic_cmd_history(fingerprint, executed_at DESC)""")
+    return c
+
+
+def record_diagnostic_cmd(
+    *, fingerprint: str, trace_id: str = "",
+    node: str = "", namespace: str = "", pod: str = "",
+    cmd: str = "", reason: str = "",
+    exit_code: int = 0, stdout: str = "", stderr: str = "",
+    approved_by: str = "", approval_id: str = "",
+) -> None:
+    """审批执行后写一条历史记录.
+
+    stdout/stderr 截断到 4KB 防止 DB 膨胀.
+    fingerprint 空时不写 (没有可关联的故障).
+    """
+    if not fingerprint or not cmd:
+        return
+    head_limit = 4096
+    stdout_head = (stdout or "")[:head_limit]
+    stderr_head = (stderr or "")[:head_limit]
+    with _lock:
+        c = _conn_with_diag()
+        try:
+            c.execute(
+                """INSERT INTO diagnostic_cmd_history
+                   (fingerprint, trace_id, node, namespace, pod, cmd, reason,
+                    exit_code, stdout_head, stderr_head,
+                    approved_by, approval_id, executed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (fingerprint, trace_id, node, namespace, pod, cmd, reason,
+                 exit_code, stdout_head, stderr_head,
+                 approved_by, approval_id, int(time.time())),
+            )
+        finally:
+            c.close()
+
+
+def list_diagnostic_history(fingerprint: str, limit: int = 5) -> list:
+    """同指纹故障历史命令 (按 executed_at 倒序).
+
+    Investigator 命中 Memory 时调用, 拿到历史命令 + 结果给 LLM 参考.
+    """
+    if not fingerprint:
+        return []
+    with _lock:
+        c = _conn_with_diag()
+        try:
+            rows = c.execute(
+                """SELECT cmd, reason, exit_code, stdout_head, stderr_head,
+                          approved_by, executed_at, node, namespace, pod
+                   FROM diagnostic_cmd_history
+                   WHERE fingerprint=?
+                   ORDER BY executed_at DESC LIMIT ?""",
+                (fingerprint, limit),
+            ).fetchall()
+        finally:
+            c.close()
+    out = []
+    for r in rows:
+        out.append({
+            "cmd": r[0],
+            "reason": r[1],
+            "exit_code": r[2],
+            "stdout_head": r[3] or "",
+            "stderr_head": r[4] or "",
+            "approved_by": r[5],
+            "executed_at": r[6],
+            "node": r[7],
+            "namespace": r[8],
+            "pod": r[9],
+        })
+    return out
