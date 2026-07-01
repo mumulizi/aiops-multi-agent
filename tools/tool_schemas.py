@@ -234,6 +234,100 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ssh_node_with_approval",
+            "description": (
+                "提交需人审的节点 shell 命令. 只读白名单 (ssh_node_readonly) 挡了"
+                "关键诊断时使用. 运维在 IM 群里 approve 后, daemon 5s 内 pick up "
+                "异步执行, 结果进 fault_memory 供下次同指纹故障复用. "
+                "调用后**立即**返回 [已派单审批 task_id=xxx], 本轮拿不到证据, "
+                "LLM 应基于现有证据先 final. "
+                "典型场景: "
+                "(1) crictl pull <image> 验证镜像可达 (ImagePullBackOff 诊断); "
+                "(2) systemctl restart kubelet 后再观察 (kubelet 卡住); "
+                "(3) 突破只读白名单的其他排查. "
+                "硬黑名单 (rm/dd/mkfs/shutdown/kubectl delete --all/iptables -F) "
+                "永远不入审批通道, 直接拒. "
+                "reason 字段必须一句话写清'为什么要跑 + 期望验证什么' (>=10 字, "
+                "不能写'试一下'/'看看' 这种)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "K8s 节点名或 IP, 必须出现在 kubectl get nodes 列表",
+                    },
+                    "cmd": {
+                        "type": "string",
+                        "description": "完整 shell 命令 (不过只读白名单, 但过硬黑名单)",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "给运维看的执行理由, 一句话写清'为什么要跑 + 期望验证什么', "
+                            ">=10 字, 拒 '试一下' 等空话"
+                        ),
+                    },
+                    "trace_id": {
+                        "type": "string",
+                        "description": "(可选) 关联诊断周期, 便于运维查上下文",
+                    },
+                    "fingerprint": {
+                        "type": "string",
+                        "description": (
+                            "(可选) 故障指纹, 用于写入 fault_memory 给下次复用. "
+                            "不写就没法复用, 建议尽量提供."
+                        ),
+                    },
+                },
+                "required": ["node", "cmd", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kubectl_exec_with_approval",
+            "description": (
+                "同 ssh_node_with_approval, 但在 Pod 内执行. "
+                "适用需要 kubectl exec 进容器跑诊断的场景 (容器内配置检查 / "
+                "运行时状态). 硬黑名单同 ssh 通道."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Pod 完整名",
+                    },
+                    "namespace": {
+                        "type": "string",
+                        "description": "Pod 所在 namespace",
+                    },
+                    "cmd": {
+                        "type": "string",
+                        "description": "完整 shell 命令 (不过只读白名单, 但过硬黑名单)",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "给运维看的执行理由, >=10 字",
+                    },
+                    "trace_id": {
+                        "type": "string",
+                        "description": "(可选) 关联诊断周期",
+                    },
+                    "fingerprint": {
+                        "type": "string",
+                        "description": "(可选) 故障指纹, 用于写入 fault_memory 复用",
+                    },
+                },
+                "required": ["name", "namespace", "cmd", "reason"],
+            },
+        },
+    },
 ]
 
 

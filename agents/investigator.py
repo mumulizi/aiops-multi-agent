@@ -203,6 +203,41 @@ C. 已经调了 5+ 步仍无定论 → 输出"证据不足"结论 + 列已排除
 - ImagePullBackOff: 镜像名错, describe 一次就够, 不需要 ssh 节点
 - 启动参数错 (flag provided but not defined): 日志一行清楚, ssh 没必要
 - StatefulSet/RS Pod OOMKilled: 容器内事故, 看日志即可, ssh 节点反而绕远
+
+================================================================
+七. 申请人审命令 (v2.14)
+================================================================
+当只读白名单不够用时, 你可以用 ssh_node_with_approval / kubectl_exec_with_approval
+**提交人审请求**. 运维在 IM 群里 approve 后, daemon 真跑命令, 结果进 fault_memory,
+下次同指纹故障可秒级复用.
+
+何时申请:
+- 只读白名单挡了关键诊断 (例: crictl pull 验证镜像可达, ImagePullBackOff 诊断)
+- 需要轻量状态变更才能诊断 (例: systemctl restart kubelet 后再观察)
+- 必须有明确假设 + 验证理由, 不要为了"试一下"申请
+- reason 必须一句话写清"为什么要跑 + 期望验证什么" (>=10 字)
+
+调用后**立即**返回 "[已派单审批 task_id=xxx]", **本轮拿不到这条证据**.
+你应该:
+1. 基于现有证据先 final 一个临时结论 (置信度可以是"中", 注明缺什么证据)
+2. 审批通过后, daemon 自动跑 + 结果进 Memory, 下次同故障自动复用
+
+硬黑名单 (永远不入审批通道, 别试):
+- rm / dd / mkfs / fdisk / shutdown / reboot / iptables -F
+- kubectl delete --all / drop database / :(){:|:&};: (fork bomb)
+- 数据销毁 / 系统断电 / 批量删 这种"出了事没法回滚"的操作
+- 硬黑名单命中会直接返回 [硬黑名单拒], 不要绕
+
+期望行为对比:
+✗ 旧: 看到 ImagePullBackOff → 直接 final "镜像不存在" 不申请验证
+✓ 新: 看到 ImagePullBackOff → 用现有 events 先 final (置信度 "中"),
+      同时申请 ssh_node_with_approval(节点, "crictl pull <image>",
+      "验证镜像仓库可达 + 拉取是否成功"), 结果异步进 Memory
+
+✗ 旧: 看到 kubelet 卡住 → final "节点问题, 请人工排查"
+✓ 新: 看到 kubelet 卡住 → 现有证据先 final, 同时申请
+      ssh_node_with_approval(节点, "systemctl restart kubelet",
+      "kubelet 已卡 10min, 重启是标准恢复步骤, 之后我会验证 Pod 状态")
 """
 
 # Function Calling 模式: 不需要描述工具列表, schema 已经绑定到 LLM
@@ -566,6 +601,18 @@ def investigator_node(state: AlertState) -> AlertState:
         state["fingerprint"] = fp
         state["from_memory"] = False
 
+    # v2.14: 拉同指纹的历史诊断命令 (曾人审执行过的命令 + 结果)
+    diag_history = []
+    fp_now = state.get("fingerprint", "")
+    if fp_now and retry_count == 0:
+        try:
+            from tools.fault_memory import list_diagnostic_history
+            diag_history = list_diagnostic_history(fp_now, limit=5)
+            if diag_history:
+                _log(f"[Investigator] 📚 同指纹历史命令 {len(diag_history)} 条 (审批执行过, 供参考)")
+        except Exception as e:
+            _log(f"[Investigator] 历史命令查询失败 (不影响): {e}")
+
     if retry_count == 0:
         if mode == "light":
             _log("[Investigator] 开始轻量诊断 (3 步快诊, medium 级异常)")
@@ -595,7 +642,39 @@ def investigator_node(state: AlertState) -> AlertState:
             f"  请重新分析根因, 给出不同的诊断思路 (例如: 不是 runtime 问题"
             f"而是依赖/配置/资源限制), 避免推荐同样会失败的方案."
         )
-    user_msg = (f"事件摘要: {summary}\n\n告警明细: {alerts}{extra_ctx}\n\n"
+
+    # v2.14: 若有同指纹历史命令, 拼进 extra_ctx 给 LLM 参考
+    if diag_history:
+        lines = ["\n\n📚 此故障曾审批执行过以下诊断命令 (最近 5 条, 供参考):"]
+        for h in diag_history:
+            cmd_short = h["cmd"][:100]
+            approved_by = h.get("approved_by") or "?"
+            ec = h.get("exit_code", "?")
+            reason = (h.get("reason") or "")[:60]
+            stdout_head = (h.get("stdout_head") or "").strip()[:200]
+            stderr_head = (h.get("stderr_head") or "").strip()[:200]
+            lines.append(f"  - cmd: {cmd_short}")
+            lines.append(f"    reason: {reason}  approved_by: {approved_by}  exit={ec}")
+            if stdout_head:
+                lines.append(f"    stdout: {stdout_head}")
+            if stderr_head:
+                lines.append(f"    stderr: {stderr_head}")
+        lines.append(
+            "\n提示: 若历史命令已经证实过某个根因, 可以直接 final. "
+            "若需要新证据, 可以再申请新的 with_approval 命令."
+        )
+        extra_ctx += "\n".join(lines)
+
+    # v2.14: 把当前 fingerprint 塞进 user_msg, LLM 可以在 with_approval 调用时传回
+    fp_hint = ""
+    if fp_now:
+        fp_hint = (
+            f"\n\n当前故障指纹: fingerprint={fp_now} "
+            f"(调 ssh_node_with_approval/kubectl_exec_with_approval 时,"
+            f"传这个 fingerprint 让结果进 Memory 供下次复用)"
+        )
+
+    user_msg = (f"事件摘要: {summary}\n\n告警明细: {alerts}{extra_ctx}{fp_hint}\n\n"
                 f"请按上面的方法论调查:\n"
                 f"1) 先假设根因落在哪一层 (容器进程/Pod 配置/Host/集群)\n"
                 f"2) 选最能验证或推翻假设的工具\n"

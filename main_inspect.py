@@ -445,6 +445,14 @@ if __name__ == "__main__":
         except Exception as e:
             _log(f"[调度器] verifier_worker 启动失败 (不影响主流程): {e}")
 
+    # v2.14: 启动审批命令执行 daemon (除非 APPROVAL_EXEC_ENABLED=false)
+    if os.getenv("APPROVAL_EXEC_ENABLED", "true").lower() == "true":
+        try:
+            from agents.approval_exec_worker import start as start_approval_exec
+            start_approval_exec()
+        except Exception as e:
+            _log(f"[调度器] approval_exec_worker 启动失败 (不影响主流程): {e}")
+
     main_loop(
         interval_sec=args.interval,
         top_n=args.top,

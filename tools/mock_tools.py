@@ -95,6 +95,8 @@ def get_recent_changes(namespace: str, hours: int = 2) -> str:
 from tools.ssh_tools import (
     ssh_run as _real_ssh_run,
     kubectl_exec_readonly as _real_kubectl_exec_readonly,
+    ssh_node_with_approval as _real_ssh_node_with_approval,
+    kubectl_exec_with_approval as _real_kubectl_exec_with_approval,
 )
 
 
@@ -117,6 +119,37 @@ def kubectl_exec_readonly(name: str, namespace: str, cmd: str) -> str:
     return _real_kubectl_exec_readonly(name=name, namespace=namespace, cmd=cmd)
 
 
+# === v2.14: 需人审的命令 (突破白名单, 走 IM 审批异步执行) ===
+
+def ssh_node_with_approval(node: str, cmd: str, reason: str,
+                            trace_id: str = "",
+                            fingerprint: str = "") -> str:
+    """提交需人审的节点 shell 命令.
+
+    用途: 只读白名单挡了关键诊断 (crictl pull 验证镜像可达), 或需要轻量状态变更
+    (systemctl restart kubelet) 才能诊断时使用.
+
+    reason 必须一句话写清'为什么要跑 + 期望验证什么' (>=10 字).
+    调用后立即返回 [已派单审批 task_id=xxx], LLM 不阻塞, 结果异步进 fault_memory.
+    硬黑名单 (rm/dd/mkfs/shutdown/kubectl delete --all) 永远不入审批通道.
+    """
+    return _real_ssh_node_with_approval(
+        node=node, cmd=cmd, reason=reason,
+        trace_id=trace_id, fingerprint=fingerprint,
+    )
+
+
+def kubectl_exec_with_approval(name: str, namespace: str, cmd: str,
+                                reason: str,
+                                trace_id: str = "",
+                                fingerprint: str = "") -> str:
+    """同上, 但在 Pod 内执行. 适用需要 kubectl exec 进容器跑诊断."""
+    return _real_kubectl_exec_with_approval(
+        name=name, namespace=namespace, cmd=cmd, reason=reason,
+        trace_id=trace_id, fingerprint=fingerprint,
+    )
+
+
 TOOLS = {
     "prometheus_query": prometheus_query,
     "kubectl_describe": kubectl_describe,
@@ -124,6 +157,8 @@ TOOLS = {
     "get_recent_changes": get_recent_changes,
     "ssh_node_readonly": ssh_node_readonly,
     "kubectl_exec_readonly": kubectl_exec_readonly,
+    "ssh_node_with_approval": ssh_node_with_approval,
+    "kubectl_exec_with_approval": kubectl_exec_with_approval,
 }
 
 _PROM_HINT = (
@@ -153,6 +188,16 @@ TOOL_DESCRIPTIONS = {
         "在 Pod 里跑只读命令查容器内部 (/etc/config 实际内容/env/进程/网络). "
         "参数 name (pod 名), namespace, cmd (只读 shell 命令). "
         "白名单跟 ssh_node_readonly 一致."
+    ),
+    "ssh_node_with_approval": (
+        "提交需人审的节点 shell 命令. 只读白名单挡了关键诊断时使用. "
+        "参数 node, cmd, reason (给运维看的一句话理由, >=10 字). "
+        "运维 IM approve 后 daemon 异步跑, 结果进 fault_memory 供下次复用. "
+        "本轮拿不到证据, LLM 应基于现有证据先 final."
+    ),
+    "kubectl_exec_with_approval": (
+        "同 ssh_node_with_approval, 但在 Pod 内执行. "
+        "参数 name, namespace, cmd, reason."
     ),
 }
 
