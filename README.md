@@ -53,6 +53,14 @@
   - 安全闸: 命令前缀白名单 + 子命令二级白名单 + dangerous token 黑名单 (rm/sed -i/systemctl restart/kubectl 写操作/curl POST 等 60+ token) + 重定向/反引号/`$()` 字符级拦截 + ssh 节点必须在 K8s nodes 列表
   - 资源闸: 单命令 10s 超时 + 输出截断 4KB + (node, prefix) 1h 5 次速率
   - 跟 L3/L2/L4 修复路径不重叠: 只管只读诊断, 任何状态变更继续走 Remediator → ApprovalGate → Executor
+- **v2.14 人审突破白名单 (审批命令通道)**: Investigator 新增 `ssh_node_with_approval` + `kubectl_exec_with_approval` 两个工具, 让 LLM 能申请**突破白名单**的命令 (如 `crictl pull` 验证镜像可达, `systemctl restart kubelet` 后再观察), 运维在 IM 群里 approve 后 daemon 异步执行, 结果进 `fault_memory.diagnostic_cmd_history` 形成学习闭环.
+  - **不阻塞诊断**: LLM 调用后立即返回 `[已派单审批 task_id=xxx]`, 应基于现有证据先 final 临时结论; 审批结果异步进 Memory, 下次同指纹故障可秒级复用
+  - **硬黑名单**: rm/dd/mkfs/shutdown/reboot/iptables -F/kubectl delete --all/`:(){:|:&};:` 永远不入审批通道 (不可逆或影响面太大, 必须人工 ssh 跑)
+  - **reason 强制**: 必须一句话写清"为什么要跑 + 期望验证什么" (>=10 字), 拒 "试一下"/"看看" 等空话
+  - **异步执行**: daemon 线程每 5s 扫 SQLite, approve → subprocess.run (10s 超时 + 输出 4KB 截断) → 写结果 → 推第二条 IM → 写 fault_memory
+  - **学习闭环**: Investigator 命中 Memory 时自动读 `diagnostic_cmd_history` 最近 5 条, 把历史命令+结果塞进 user_msg 给 LLM 看. 上次证实过的根因这次可直接 final
+  - **速率限制**: 单 (trace_id, target) 1h 最多 3 条审批请求, 防 LLM 刷屏
+  - 配套 CLI: `scripts/aiops_review.py list/show/approve/deny` 自动区分 🔍 diagnostic_cmd vs 🔧 remediation
 - **本地 LLM**: Qwen2.5-32B-Instruct-AWQ 在 2 卡 Tesla T4 上 vLLM TP=2 部署 (从 7B 升级而来),
   OpenAI 兼容接口; 也可通过 env 切换关键 Agent 走云 API 强模型 (混合架构,
   DeepSeek-V3 / 通义千问 API / 任何 OpenAI 兼容端点)
@@ -724,6 +732,11 @@ export SSH_USER=root                    # ssh 登录用户 (默认 root)
 export SSH_KEY_PATH=                    # 默认空, 用系统 ssh-agent 或 ~/.ssh/id_rsa
 export SSH_STRICT_HOST_CHECK=no         # 兼容跳板机, 生产建议 yes
 export SSH_CMD_TIMEOUT_SEC=10           # 单命令超时 (默认 10s)
+
+# v2.14 审批命令 daemon (默认开, 让 LLM 能申请突破白名单)
+export APPROVAL_EXEC_ENABLED=true       # false 关闭, 现有只读工具不受影响
+export APPROVAL_EXEC_LOOP_SEC=5         # daemon 扫表间隔 (默认 5s)
+export APPROVAL_EXEC_TTL_SEC=1800       # 审批 TTL, 超时自动 expired (默认 30min)
 
 # IM 通知 (可选, 不设则只写本地 alerts/ 文件)
 export IM_PROVIDER=infoflow         # infoflow / dingtalk / wecom / feishu

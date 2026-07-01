@@ -1623,3 +1623,146 @@ ssh_tools 校验逻辑跑通:
 - 不做 FixSuggester (诊断深入到拿原文证据后, 不需要再单独生成"人工命令")
 - 不持久化 ssh session (每次新连接, 简化设计)
 
+
+---
+
+### v2.14 人审突破白名单 (审批命令通道) — 让 LLM 能"申请高危操作", 运维 approve 后异步执行 (2026.06.30)
+
+#### 背景
+
+v2.13 生产实跑后用户反馈:
+
+> "为什么需要我设置各种命令的操作方式, 而不是直接接入模型后, 交给模型自己判断?
+> DeepSeek-V3 已经比本地 Qwen 更强大, 为什么还做不到像 Opus 4.7 那样完全由模型
+> 自己去理解到底该怎么做能不能执行?"
+
+**核心答案**: Claude Code 的"自由"是错觉 — 每次 Bash 调用前有 permission prompt
+让你按 yes. 生产 AIOps 无人值守, 没人按 yes. 模型强解决的是"诊断准不准", 不是
+"该不该执行". 你在 Claude Code 里让 Opus 跑 `rm -rf /` 它会先问你; 它没问的,
+是因为你已经按了 "Always allow Bash" 授权 — 那是你的责任, 不是模型的判断力.
+
+**正确路径**: 让模型敢于提出高危操作, 但每次都过人审. v2.14 就是这个能力.
+
+#### 改动
+
+新增 2 个 Investigator 工具:
+
+| 工具 | 用途 |
+|------|------|
+| `ssh_node_with_approval(node, cmd, reason, ...)` | 提交需人审的节点命令 |
+| `kubectl_exec_with_approval(name, ns, cmd, reason, ...)` | 提交需人审的 Pod 内命令 |
+
+**关键: 立即返回, 不阻塞诊断**. LLM 调用后拿到 `[已派单审批 task_id=xxx]`
+提示, 本轮拿不到这条证据, 应基于现有证据 final 临时结论. 结果异步进 Memory,
+下次同指纹故障可秒级复用.
+
+#### 数据库扩展
+
+- `approval_pending` 表加 `kind` (remediation/diagnostic_cmd) / `cmd_payload` /
+  `execution_result` 3 列 (兼容旧 remediation 审批)
+- 新表 `diagnostic_cmd_history` (fingerprint + cmd + exit + stdout/stderr +
+  approved_by + timestamp), 供 Investigator 下次同指纹故障读取
+
+#### 硬黑名单 (永远不入审批通道)
+
+```
+rm / dd / mkfs / fdisk / shutdown / reboot / iptables -F /
+kubectl delete --all / drop database / :(){:|:&};: / docker system prune /
+> /dev/sd... / modprobe / halt / poweroff
+```
+
+理由: 这类不可逆/影响面太大的操作就算运维 approve 也不该 AIOps 代跑, 必须
+人工 ssh 跑, 留完整审计. 命中 → 立即返回 `[硬黑名单拒]`, 不写 SQLite, 不推 IM.
+
+#### 分工
+
+```
+诊断阶段 (Investigator):
+  ├─ 只读工具 (v2.13, 白名单硬闸)
+  │   ssh_node_readonly / kubectl_exec_readonly
+  └─ 需人审工具 (v2.14, 突破白名单)
+      ssh_node_with_approval / kubectl_exec_with_approval
+      ↓
+      派单 → IM 推运维 → approve → daemon 异步执行 → 结果进 Memory
+
+修复阶段 (Remediator → ApprovalGate → Executor) — 保持不动
+  └─ L3 自动 / L2 人审 / L4 拒绝 / R3 黑名单
+```
+
+**新加的通道跟现有 L2 Approval Gate 是同一张表** (`approvals`), 只是 kind 字段区分:
+- `kind=remediation`: 原有 plan 审批 (restart_pod 等修复动作)
+- `kind=diagnostic_cmd`: 新增诊断命令审批
+
+CLI `scripts/aiops_review.py` 自动区分显示 (🔍 diagnostic_cmd vs 🔧 remediation).
+
+#### daemon worker
+
+新建 `agents/approval_exec_worker.py` (跟 verifier_worker 同款设计):
+- 每 5s 扫 `kind='diagnostic_cmd' AND status='approved' AND execution_result IS NULL`
+- ssh 通道: `subprocess.run(["ssh", "-o", "BatchMode=yes", ..., cmd])`
+- kubectl_exec 通道: `subprocess.run(["kubectl", "exec", "-n", ns, pod, "--", "sh", "-c", cmd])`
+- 10s 超时强杀 + stdout/stderr 各 4KB 截断
+- 写结果 → 推第二条 IM → 调 `fault_memory.record_diagnostic_cmd`
+
+#### 学习闭环 (关键设计)
+
+Investigator 命中 `fault_memory.lookup` 时, 额外查 `list_diagnostic_history(fp, limit=5)`.
+拿到历史命令 + 结果拼进 user_msg:
+
+```
+📚 此故障曾审批执行过以下诊断命令 (最近 5 条, 供参考):
+  - cmd: crictl pull registry.baidubce.com/foo/bar:v1
+    reason: 验证镜像仓库可达 + 拉取是否成功  approved_by: opsuser  exit=1
+    stderr: rpc error: code = NotFound
+  - cmd: kubectl exec dcgm-exporter -- ldconfig -p | grep nvml
+    reason: 查容器内动态库路径  approved_by: opsuser  exit=0
+    stdout: libnvidia-ml.so.1 => /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+
+提示: 若历史命令已经证实过某个根因, 可以直接 final. 若需要新证据,
+     可以再申请新的 with_approval 命令.
+```
+
+**这才是真正的学习闭环** — 人审过的命令沉淀成"这个故障的排查 SOP", LLM 下次
+自动复用. Anthropic prompt caching 让重复上下文几乎零成本.
+
+#### 期望行为对比
+
+| 场景 | v2.13 (仅只读) | v2.14 (可申请人审) |
+|------|--------------|---------------------|
+| ImagePullBackOff | final "镜像不存在" 建议 | final 临时结论 + 申请 `crictl pull` 验证 |
+| kubelet 卡住 | final "节点问题, 请人工排查" | final 临时结论 + 申请 `systemctl restart kubelet` |
+| NVML 加载失败 | ssh readonly + lsmod (若能 ssh) | + 申请 `nvidia-smi -q` 拿详细版本信息 |
+| 复现故障 | 每次都跑完整流水线 | 命中 Memory + 复用历史 diagnostic_cmd 结果, 秒级 final |
+
+#### 防滥用
+
+- **reason 校验**: 必填 + ≥10 字, 拦 "试一下"/"看看"/"just checking" 等空话
+- **速率限制**: 单 (trace_id, target) 1h 内最多 3 条审批, 防 LLM 刷屏
+- **TTL**: 30min 未审批自动 expired
+- **硬黑名单**: 永远不入审批通道
+
+#### 新环境变量
+
+- `APPROVAL_EXEC_ENABLED` (默认 `true`, false 关闭 daemon + 工具直接返回 `[已禁用]`)
+- `APPROVAL_EXEC_LOOP_SEC` (默认 5, daemon 扫表间隔)
+- `APPROVAL_EXEC_TTL_SEC` (默认 1800, 审批 TTL)
+- 复用 `SSH_USER` / `SSH_KEY_PATH` / `SSH_STRICT_HOST_CHECK` / `SSH_CMD_TIMEOUT_SEC`
+
+#### 兼容性
+
+- 允许小幅 breaking change (`APPROVAL_EXEC_ENABLED` 默认 true)
+- false 一键关掉 (工具仍存在, 但调用返回 `[已禁用]`)
+- 现有 L2 Approval Gate (remediation 审批) 完全不动
+- 现有 v2.13 只读工具 (ssh_node_readonly 等) 不动
+- CLI aiops_review 向后兼容: 老 remediation 审批照原流程
+
+#### 验证
+
+- 硬黑名单 9 类命令全拒 + 大小写不敏感
+- reason 校验拦空/短/'试一下' 空话
+- 端到端: 提交 → SQLite → IM 派单 → approve → daemon 执行 → 结果 → fault_memory
+- kubectl_exec 通道等效
+- 速率限制: 同 trace+target 3 次后拒
+- 未知 kind 走失败路径 status=failed
+- TTL 过期 pending 自动标 expired
+- 已执行任务不重复 pick up
