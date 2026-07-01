@@ -479,3 +479,72 @@ def kubectl_exec_readonly(name: str, namespace: str, cmd: str,
     if not stdout and not stderr and rc == 0:
         lines.append("(无输出)")
     return "\n".join(lines)
+
+
+# === v2.14: 需人审的命令 (突破白名单, 走 IM 审批异步执行) ===
+
+def ssh_node_with_approval(node: str, cmd: str, reason: str,
+                            trace_id: str = "",
+                            fingerprint: str = "") -> str:
+    """提交需人审的节点 shell 命令.
+
+    用途: 想跑超出只读白名单的命令 (systemctl restart / crictl pull /
+          mount 检查 / 修改任何状态) — 必须由运维 IM approve 后才执行.
+
+    参数:
+      node: K8s 节点名
+      cmd: 完整 shell 命令 (不过只读白名单, 但过硬黑名单)
+      reason: 给运维看的执行理由 (>=10 字, 不能太泛)
+      trace_id: (可选) LangGraph trace ID, 关联诊断周期
+      fingerprint: (可选) 故障指纹, 用于写 diagnostic_cmd_history 下次复用
+
+    立即返回 [已派单审批 task_id=xxx], LLM 不阻塞.
+    运维在 IM 群里 approve 后, daemon 自动跑, 结果进 fault_memory.
+    """
+    # 校验最低要求: node 必须在 K8s nodes 列表 (跟只读工具一致, 防编造)
+    if not node:
+        return "[拒] node 必填"
+    if not _node_allowed(node):
+        return f"[拒] 节点 {node!r} 不在 K8s nodes 列表 (防止编造目标)"
+
+    from tools.approval_exec import submit_diagnostic_approval
+    return submit_diagnostic_approval(
+        kind="ssh",
+        payload={
+            "node": node,
+            "cmd": cmd,
+            "reason": reason,
+            "trace_id": trace_id,
+            "fingerprint": fingerprint,
+        },
+    )
+
+
+def kubectl_exec_with_approval(name: str, namespace: str, cmd: str,
+                                reason: str,
+                                trace_id: str = "",
+                                fingerprint: str = "") -> str:
+    """同上, 但在 Pod 内执行. 适用要 kubectl exec 进容器跑诊断的场景.
+
+    参数:
+      name: pod 完整名
+      namespace: pod 所在 namespace
+      cmd: 完整 shell 命令
+      reason: 给运维看的执行理由
+      trace_id: (可选)
+      fingerprint: (可选)
+    """
+    if not name or not namespace:
+        return "[拒] name 和 namespace 必填"
+    from tools.approval_exec import submit_diagnostic_approval
+    return submit_diagnostic_approval(
+        kind="kubectl_exec",
+        payload={
+            "pod": name,
+            "namespace": namespace,
+            "cmd": cmd,
+            "reason": reason,
+            "trace_id": trace_id,
+            "fingerprint": fingerprint,
+        },
+    )
