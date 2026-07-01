@@ -96,6 +96,12 @@ def submit_diagnostic_approval(
       ttl_sec: 默认 APPROVAL_EXEC_TTL_SEC (env, 默认 1800)
 
     错误情况全部返回给 LLM 可读的字符串, 不抛异常.
+
+    v2.14+ 自动审批模式:
+    - APPROVAL_AUTO_APPROVE=true 时, 派单后**立即**标 approved,
+      daemon 会在几秒内 pick up 执行. 测试环境用.
+    - 硬黑名单仍拦, 速率限制仍生效, reason 校验仍生效 —
+      自动审批只是跳过"人手 approve"这一步.
     """
     if os.getenv("APPROVAL_EXEC_ENABLED", "true").lower() != "true":
         return "[已禁用] APPROVAL_EXEC_ENABLED=false, 该工具已关闭"
@@ -162,17 +168,38 @@ def submit_diagnostic_approval(
 
     _log(f"新审批 task_id={aid} kind={kind} target={target} reason={reason[:60]}")
 
-    # 7. 推 IM
+    # v2.14+ 自动审批模式 (测试环境用)
+    auto_approve = os.getenv("APPROVAL_AUTO_APPROVE", "false").lower() == "true"
+    if auto_approve:
+        try:
+            approval_store.mark_approved(aid, "auto-approve")
+            _log(f"⚡ APPROVAL_AUTO_APPROVE=true, 已自动 approve task_id={aid}, "
+                 f"daemon 将在几秒内执行")
+        except Exception as e:
+            _log(f"⚠ 自动审批失败 (task 仍是 pending, 等人手审): {e}")
+
+    # 7. 推 IM (即使自动审批也推, 方便运维看到)
     try:
-        msg = format_approval_message(aid, kind, payload)
+        msg = format_approval_message(aid, kind, payload, auto_approved=auto_approve)
         push_result = send_message(msg) if send_message else {"im_sent": False}
     except Exception as e:
         push_result = {"im_sent": False, "error": str(e)}
 
-    im_status = "已推送" if push_result.get("im_sent") else "IM 未推送 (仍需 CLI approve)"
+    im_status = "已推送" if push_result.get("im_sent") else "IM 未推送"
     ttl_min = (ttl_sec or approval_store.DEFAULT_TTL_SEC) // 60
 
     # 8. 返回给 LLM 的立即响应
+    if auto_approve:
+        return (
+            f"[已派单审批 + 自动通过] task_id={aid}\n"
+            f"  目标: {target}\n"
+            f"  命令: {cmd}\n"
+            f"  理由: {reason}\n"
+            f"  模式: 自动审批 (APPROVAL_AUTO_APPROVE=true)\n"
+            f"  → daemon 5s 内 pick up 执行, 结果稍后进 fault_memory\n"
+            f"  → IM: {im_status}\n"
+            f"  → 本轮诊断拿不到执行结果 (异步), 请基于现有证据 final"
+        )
     return (
         f"[已派单审批] task_id={aid}\n"
         f"  目标: {target}\n"
@@ -186,7 +213,8 @@ def submit_diagnostic_approval(
 
 # === IM 消息渲染 ===
 
-def format_approval_message(aid: str, kind: str, payload: dict) -> str:
+def format_approval_message(aid: str, kind: str, payload: dict,
+                             auto_approved: bool = False) -> str:
     """派单消息 (IM 第一条)."""
     cmd = payload.get("cmd", "")
     reason = payload.get("reason", "")
@@ -195,6 +223,21 @@ def format_approval_message(aid: str, kind: str, payload: dict) -> str:
         target_line = f"Node:    {payload.get('node', '')}"
     else:
         target_line = f"Pod:     {payload.get('namespace', '')}/{payload.get('pod', '')}"
+
+    if auto_approved:
+        # 测试环境自动审批, 消息简化, 告知运维不需要 approve
+        return (
+            f"🤖 [AIOps 诊断助手] ⚡ 自动审批 (测试环境)\n"
+            f"TaskID:  {aid}\n"
+            f"Trace:   {trace_id}\n"
+            f"{target_line}\n"
+            f"Cmd:     {cmd}\n"
+            f"Reason:  {reason}\n"
+            f"\n"
+            f"→ 已自动通过, daemon 即将异步执行\n"
+            f"→ 若要紧急拦截, 立即 deny {aid}"
+        )
+
     return (
         f"🤖 [AIOps 诊断助手] 申请执行诊断命令\n"
         f"TaskID:  {aid}\n"

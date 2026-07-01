@@ -738,6 +738,12 @@ export APPROVAL_EXEC_ENABLED=true       # false 关闭, 现有只读工具不受
 export APPROVAL_EXEC_LOOP_SEC=5         # daemon 扫表间隔 (默认 5s)
 export APPROVAL_EXEC_TTL_SEC=1800       # 审批 TTL, 超时自动 expired (默认 30min)
 
+# ⚡ v2.14 自动审批模式 (测试环境用!!!)
+# 设 true 后 with_approval 命令派单后立即标 approved, daemon 秒级执行,
+# 不需要人手 approve. 硬黑名单/速率/reason 校验仍生效, 只是跳过人审这一步.
+# 生产环境务必 false (默认).
+export APPROVAL_AUTO_APPROVE=false
+
 # IM 通知 (可选, 不设则只写本地 alerts/ 文件)
 export IM_PROVIDER=infoflow         # infoflow / dingtalk / wecom / feishu
 export IM_WEBHOOK_URL='http://<im-api-host>/...?access_token=xxx'
