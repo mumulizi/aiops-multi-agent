@@ -23,6 +23,7 @@ import time
 from tools.approval_store import (
     list_pending, list_recent, get, mark_approved, mark_rejected, mark_executed,
     is_expired, DEFAULT_TTL_SEC,
+    get_diagnostic,  # v2.14: 诊断命令审批
 )
 from tools.remediation_actions import (
     is_action_allowed, execute_action, _split_target, _capture_pod_state,
@@ -86,8 +87,24 @@ def cmd_list(args):
     _log(f"待审批操作: {len(items)} 条")
     _log("-" * 90)
     for it in items:
+        # v2.14: 区分 remediation vs diagnostic_cmd
+        diag = get_diagnostic(it["id"])
+        if diag and diag.get("kind") == "diagnostic_cmd":
+            p = diag.get("payload") or {}
+            kind = p.get("kind", "?")
+            if kind == "ssh":
+                tgt = f"node:{p.get('node', '?')}"
+            else:
+                tgt = f"pod:{p.get('namespace', '?')}/{p.get('pod', '?')}"
+            _log(f"[{it['id']}]  🔍 diagnostic_cmd  age={it['age_sec']}s  remaining={it['remaining_sec']}s")
+            _log(f"   target: {tgt}")
+            _log(f"   cmd:    {(p.get('cmd', ''))[:100]}")
+            _log(f"   reason: {(p.get('reason', ''))[:100]}")
+            _log("")
+            continue
+        # 老 remediation 审批
         plan = it["plan"] or {}
-        _log(f"[{it['id']}]  age={it['age_sec']}s  remaining={it['remaining_sec']}s")
+        _log(f"[{it['id']}]  🔧 remediation  age={it['age_sec']}s  remaining={it['remaining_sec']}s")
         _log(f"   action={plan.get('action', '?')}  target={plan.get('target', '?')}  "
              f"safety={plan.get('safety_level', '?')}")
         rationale = plan.get('rationale', '')
@@ -97,6 +114,26 @@ def cmd_list(args):
 
 
 def cmd_show(args):
+    # v2.14: 先看是不是 diagnostic_cmd
+    diag = get_diagnostic(args.approval_id)
+    if diag and diag.get("kind") == "diagnostic_cmd":
+        _log(f"=== Approval {diag['id']}  (kind=diagnostic_cmd) ===")
+        _log(f"created_at  : {_fmt_time(diag['created_at'])}")
+        _log(f"status      : {diag['status']}")
+        _log(f"ttl_sec     : {diag['ttl_sec']}")
+        if diag.get('decided_by'):
+            _log(f"decided_by  : {diag['decided_by']}")
+            _log(f"decided_at  : {_fmt_time(diag['decided_at'])}")
+        _log("")
+        _log("=== Payload ===")
+        _log(json.dumps(diag["payload"], ensure_ascii=False, indent=2))
+        if diag.get("execution_result"):
+            _log("")
+            _log("=== Execution Result ===")
+            _log(json.dumps(diag["execution_result"], ensure_ascii=False, indent=2))
+        return
+
+    # 老 remediation
     rec = get(args.approval_id)
     if not rec:
         _log(f"❌ 未找到 approval_id={args.approval_id}")
@@ -130,6 +167,35 @@ def cmd_show(args):
 
 
 def cmd_approve(args):
+    # v2.14: diagnostic_cmd 走独立分支, 只标 approved, 不代执行 (daemon 会 pick up)
+    diag = get_diagnostic(args.approval_id)
+    if diag and diag.get("kind") == "diagnostic_cmd":
+        if diag["status"] != "pending":
+            _log(f"❌ 当前状态={diag['status']}, 无法批准")
+            sys.exit(1)
+        by = args.by or os.getenv("USER") or getpass.getuser() or "unknown"
+        ok, reason = mark_approved(args.approval_id, by)
+        if not ok:
+            _log(f"❌ {reason}")
+            sys.exit(1)
+        p = diag["payload"] or {}
+        _log(f"✓ {args.approval_id} (diagnostic_cmd) 已批准 by {by}")
+        _log(f"   cmd: {p.get('cmd', '')}")
+        _log(f"   → approval_exec_worker daemon 会在几秒内 pick up 执行")
+        _log(f"   → 结果会推 IM + 写入 fault_memory")
+        # 发一条 IM 提示
+        try:
+            send_message(
+                f"✅ [APPROVED diagnostic_cmd] task_id={args.approval_id}\n"
+                f"  by: {by}\n"
+                f"  cmd: {p.get('cmd', '')[:120]}\n"
+                f"  → daemon 即将异步执行, 结果稍后另发"
+            )
+        except Exception:
+            pass
+        return
+
+    # 老 remediation 走原路径
     rec = get(args.approval_id)
     if not rec:
         _log(f"❌ 未找到 approval_id={args.approval_id}")
@@ -303,6 +369,32 @@ def cmd_approve(args):
 
 
 def cmd_deny(args):
+    # v2.14: diagnostic_cmd 也走 mark_rejected (同一张表, 逻辑通用)
+    diag = get_diagnostic(args.approval_id)
+    if diag and diag.get("kind") == "diagnostic_cmd":
+        if diag["status"] != "pending":
+            _log(f"❌ 当前状态={diag['status']}, 无法拒绝")
+            sys.exit(1)
+        by = args.by or os.getenv("USER") or getpass.getuser() or "unknown"
+        reason = args.reason or "no reason"
+        ok, msg = mark_rejected(args.approval_id, by, reason)
+        if not ok:
+            _log(f"❌ {msg}")
+            sys.exit(1)
+        p = diag["payload"] or {}
+        _log(f"✗ {args.approval_id} (diagnostic_cmd) 已拒绝 by {by}, reason={reason}")
+        try:
+            send_message(
+                f"🚫 [DENIED diagnostic_cmd] task_id={args.approval_id}\n"
+                f"  by: {by}\n"
+                f"  cmd: {p.get('cmd', '')[:120]}\n"
+                f"  reason: {reason}"
+            )
+        except Exception:
+            pass
+        return
+
+    # 老 remediation
     rec = get(args.approval_id)
     if not rec:
         _log(f"❌ 未找到 approval_id={args.approval_id}")
